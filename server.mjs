@@ -39,6 +39,50 @@ async function readProfile() {
   try { return JSON.parse(await fs.readFile(path.join(dataDir, 'salon-profile.json'), 'utf8')); } catch { return {}; }
 }
 
+function decodeHtml(value = '') {
+  return value.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+}
+
+function plainText(value = '') {
+  return decodeHtml(value.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim());
+}
+
+function structuredBusinessData(html) {
+  const blocks = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+  for (const block of blocks) {
+    try {
+      const parsed = JSON.parse(block[1].trim());
+      const candidates = Array.isArray(parsed) ? parsed : [parsed, ...(parsed?.['@graph'] || [])];
+      const business = candidates.find(item => /LocalBusiness|BeautySalon|HairSalon|NailSalon|DaySpa|HealthAndBeautyBusiness/i.test(String(item?.['@type'] || '')));
+      if (business) return business;
+    } catch {}
+  }
+  return {};
+}
+
+function extractSalonProfile(html, website) {
+  const business = structuredBusinessData(html);
+  const address = business.address && typeof business.address === 'object'
+    ? [business.address.streetAddress, business.address.addressLocality, business.address.addressRegion, business.address.postalCode].filter(Boolean).join(', ')
+    : String(business.address || '');
+  const services = (business.makesOffer || business.hasOfferCatalog?.itemListElement || [])
+    .map(item => item?.itemOffered?.name || item?.name || item?.item?.name)
+    .filter(Boolean)
+    .slice(0, 12);
+  const hours = business.openingHoursSpecification
+    ? business.openingHoursSpecification.map(item => `${(item.dayOfWeek || []).join(', ')} ${item.opens || ''}-${item.closes || ''}`.trim()).join('; ')
+    : Array.isArray(business.openingHours) ? business.openingHours.join('; ') : String(business.openingHours || '');
+  const title = plainText(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || '');
+  const description = decodeHtml(html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)/i)?.[1]?.trim() || '');
+  const phone = business.telephone || html.match(/(?:tel:|phone[^>]*>)([^<]+)/i)?.[1]?.trim() || '';
+  return { website, name: business.name || title.split('|')[0].split('-')[0].trim() || salonName, title, description, address, phone, hours, services, status: 'needs_review', importedAt: new Date().toISOString() };
+}
+
+async function activeSalonProfile() {
+  const profile = await readProfile();
+  return profile.status === 'confirmed' ? profile : { ...profile, name: profile.name || salonName, address: profile.address || salonAddress };
+}
+
 function ownerCookie(email) {
   return Buffer.from(JSON.stringify({ email, at: Date.now() })).toString('base64url');
 }
@@ -166,9 +210,11 @@ async function sendEmail(to, subject, body) {
 }
 
 const receptionistPrompt = async () => {
-  const profile = await readProfile();
-  const profileContext = profile.website ? `\n\nSalon profile source: ${profile.website}\nSalon profile title: ${profile.title || salonName}\nSalon profile description: ${profile.description || 'No description imported.'}\nSalon address: ${salonAddress}` : '';
-  return promptTemplate.replaceAll('{{SALON_NAME}}', salonName).replaceAll('{{SALON_TIMEZONE}}', timezone) + profileContext;
+  const profile = await activeSalonProfile();
+  const profileName = profile.name || salonName;
+  const profileAddress = profile.address || salonAddress;
+  const profileContext = profile.website ? `\n\nSalon profile source: ${profile.website}\nSalon profile name: ${profileName}\nSalon profile description: ${profile.description || 'No description imported.'}\nSalon address: ${profileAddress}\nSalon phone: ${profile.phone || 'Not imported.'}\nSalon hours: ${profile.hours || 'Not imported.'}\nSalon services: ${(profile.services || []).join(', ') || 'Not imported.'}` : '';
+  return promptTemplate.replaceAll('{{SALON_NAME}}', profileName).replaceAll('{{SALON_TIMEZONE}}', timezone) + profileContext;
 };
 
 function toolDefinitions() {
@@ -199,7 +245,7 @@ async function handleTool(name, args) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
-    if (url.pathname === '/api/status') return json(res, 200, { salonName, address: salonAddress, phone: process.env.TWILIO_PHONE_NUMBER || '', googleConnected: Boolean(await readToken()), profile: await readProfile() });
+    if (url.pathname === '/api/status') { const profile = await activeSalonProfile(); return json(res, 200, { salonName: profile.name || salonName, address: profile.address || salonAddress, phone: process.env.TWILIO_PHONE_NUMBER || '', googleConnected: Boolean(await readToken()), profile }); }
     if (url.pathname === '/api/logs') return json(res, 200, await readLogs());
     if (url.pathname === '/api/login' && req.method === 'POST') {
       const { email } = await readBody(req);
@@ -218,7 +264,15 @@ const server = http.createServer(async (req, res) => {
         title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/\s+/g, ' ').trim() || '';
         description = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)/i)?.[1]?.trim() || '';
       } catch (error) { return json(res, 400, { error: `Could not read that website: ${error.message}` }); }
-      const profile = { website, title, description, name: salonName, address: salonAddress, importedAt: new Date().toISOString() };
+      const profile = extractSalonProfile(html, website);
+      await fs.writeFile(path.join(dataDir, 'salon-profile.json'), JSON.stringify(profile, null, 2));
+      return json(res, 200, { ok: true, profile });
+    }
+    if (url.pathname === '/api/profile/confirm' && req.method === 'POST') {
+      const current = await readProfile();
+      const body = await readBody(req);
+      const profile = { ...current, name: String(body.name || '').trim(), address: String(body.address || '').trim(), phone: String(body.phone || '').trim(), hours: String(body.hours || '').trim(), services: Array.isArray(body.services) ? body.services.map(item => String(item).trim()).filter(Boolean) : current.services || [], status: 'confirmed', confirmedAt: new Date().toISOString() };
+      if (!profile.name || !profile.address) return json(res, 400, { error: 'Please confirm the salon name and address.' });
       await fs.writeFile(path.join(dataDir, 'salon-profile.json'), JSON.stringify(profile, null, 2));
       return json(res, 200, { ok: true, profile });
     }
