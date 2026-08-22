@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: mika-ai-receptionist
+    runtime: node
+    buildCommand: pnpm install --frozen-lockfile
+    startCommand: node server.mjs
+    healthCheckPath: /api/status
+    envVars:
+      - key: NODE_VERSION
+        value: 20

@@ -1,0 +1,15 @@
+{
+  "name": "mika-ai-receptionist",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "googleapis": "^144.0.0",
+    "twilio": "^5.3.5",
+    "ws": "^8.18.0"
+  }
+}
