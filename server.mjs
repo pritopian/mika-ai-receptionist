@@ -63,12 +63,23 @@ async function appendLog(entry) {
   const logFile = path.join(dataDir, 'activity.json');
   let entries = [];
   try { entries = JSON.parse(await fs.readFile(logFile, 'utf8')); } catch {}
-  entries.unshift({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, at: new Date().toISOString(), ...entry });
+  const durableEntry = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, at: new Date().toISOString(), ...entry };
+  entries.unshift(durableEntry);
   await fs.writeFile(logFile, JSON.stringify(entries.slice(0, 200), null, 2));
+  void logActivityToSheet(durableEntry);
 }
 
 async function readLogs() {
-  try { return JSON.parse(await fs.readFile(path.join(dataDir, 'activity.json'), 'utf8')); } catch { return []; }
+  let localEntries = [];
+  try { localEntries = JSON.parse(await fs.readFile(path.join(dataDir, 'activity.json'), 'utf8')); } catch {}
+  try {
+    const { sheets } = await calendar();
+    const spreadsheetId = await ensureBookingSheet(sheets);
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Activity!A2:G200' });
+    const remoteEntries = (response.data.values || []).map(row => ({ at: row[0], type: row[1], customer: row[2], service: row[3], status: row[4], channel: row[5], details: row[6] }));
+    if (remoteEntries.length) return remoteEntries.sort((a, b) => new Date(b.at) - new Date(a.at));
+  } catch {}
+  return localEntries;
 }
 
 async function readProfile() {
@@ -134,8 +145,9 @@ function ownerCookie(email) {
 async function logActivityToSheet(entry) {
   try {
     const { sheets } = await calendar();
-    const { spreadsheetId } = JSON.parse(await fs.readFile(path.join(dataDir, 'sheet.json'), 'utf8'));
+    const spreadsheetId = await ensureBookingSheet(sheets);
     try { await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [{ addSheet: { properties: { title: 'Activity' } } }] } }); } catch {}
+    try { await sheets.spreadsheets.values.update({ spreadsheetId, range: 'Activity!A1:G1', valueInputOption: 'RAW', requestBody: { values: [['Created', 'Type', 'Customer', 'Service', 'Status', 'Channel', 'Details']] } }); } catch {}
     await sheets.spreadsheets.values.append({ spreadsheetId, range: 'Activity!A:G', valueInputOption: 'USER_ENTERED', requestBody: { values: [[new Date().toISOString(), entry.type, entry.customer || '', entry.service || '', entry.status || '', entry.channel || '', entry.details || '']] } });
   } catch (error) { console.error(`Activity sheet: ${error.message}`); }
 }
