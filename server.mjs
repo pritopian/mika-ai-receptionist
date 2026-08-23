@@ -258,9 +258,10 @@ const server = http.createServer(async (req, res) => {
       if (!/^https?:\/\//i.test(String(website || ''))) return json(res, 400, { error: 'Paste a full website URL.' });
       let title = '';
       let description = '';
+      let html = '';
       try {
         const response = await fetch(website, { headers: { 'user-agent': 'Mika salon profile importer' } });
-        const html = await response.text();
+        html = await response.text();
         title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/\s+/g, ' ').trim() || '';
         description = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)/i)?.[1]?.trim() || '';
       } catch (error) { return json(res, 400, { error: `Could not read that website: ${error.message}` }); }
