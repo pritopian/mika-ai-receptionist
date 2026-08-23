@@ -310,7 +310,16 @@ async function handleTool(name, args) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
-    if (url.pathname === '/api/status') { const profile = await activeSalonProfile(); return json(res, 200, { salonName: profile.name || salonName, address: profile.address || salonAddress, phone: process.env.TWILIO_PHONE_NUMBER || '', googleConnected: Boolean(await readToken()), sheet: await readSheetInfo(), profile }); }
+    if (url.pathname === '/api/status') {
+      const profile = await activeSalonProfile();
+      const googleConnected = Boolean(await readToken());
+      let sheet = await readSheetInfo();
+      if (googleConnected && !sheet) {
+        try { const { sheets } = await calendar(); const spreadsheetId = await ensureBookingSheet(sheets); sheet = { spreadsheetId, url: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit` }; }
+        catch (error) { console.error(`Booking sheet: ${error.message}`); }
+      }
+      return json(res, 200, { salonName: profile.name || salonName, address: profile.address || salonAddress, phone: process.env.TWILIO_PHONE_NUMBER || '', googleConnected, sheet, profile });
+    }
     if (url.pathname === '/api/logs') return json(res, 200, await readLogs());
     if (url.pathname === '/api/login' && req.method === 'POST') {
       const { email } = await readBody(req);
