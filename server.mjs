@@ -15,6 +15,10 @@ const host = process.env.HOST || '0.0.0.0';
 const salonName = process.env.SALON_NAME || 'the salon';
 const salonAddress = process.env.SALON_ADDRESS || '';
 const timezone = process.env.SALON_TIMEZONE || 'America/Los_Angeles';
+const bookingBufferMinutes = 15;
+const openDays = new Set(String(process.env.SALON_OPEN_DAYS || '1,2,3,4,5,6').split(',').map(value => Number(value.trim())).filter(Number.isInteger));
+const openTime = String(process.env.SALON_OPEN_TIME || '10:00').split(':').map(Number);
+const closeTime = String(process.env.SALON_CLOSE_TIME || '19:00').split(':').map(Number);
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
@@ -194,7 +198,10 @@ function localDateParts(date) {
 
 function toDateTime(date, hour, minute) {
   const [year, month, day] = date.split('-').map(Number);
-  return new Date(Date.UTC(year, month - 1, day, hour + 7, minute));
+  const guess = new Date(Date.UTC(year, month - 1, day, hour, minute));
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(guess);
+  const localGuess = Date.UTC(Number(parts.find(item => item.type === 'year').value), Number(parts.find(item => item.type === 'month').value) - 1, Number(parts.find(item => item.type === 'day').value), Number(parts.find(item => item.type === 'hour').value), Number(parts.find(item => item.type === 'minute').value));
+  return new Date(guess.getTime() + (guess.getTime() - localGuess));
 }
 
 async function calendar() {
@@ -203,25 +210,53 @@ async function calendar() {
   return { auth, calendar: google.calendar({ version: 'v3', auth }), sheets: google.sheets({ version: 'v4', auth }) };
 }
 
-async function checkAvailability({ date, service, gel = false, technician = '' }) {
+async function calendarBusy(start, end) {
   const { calendar: cal } = await calendar();
-  const detail = serviceDetails(service, gel);
-  const day = date || new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date());
-  const start = toDateTime(day, 10, 0);
-  const end = toDateTime(day, 19, 0);
   const busy = await cal.freebusy.query({ requestBody: { timeMin: start.toISOString(), timeMax: end.toISOString(), items: [{ id: process.env.GOOGLE_CALENDAR_ID || 'primary' }] } });
-  const events = busy.data.calendars?.[process.env.GOOGLE_CALENDAR_ID || 'primary']?.busy || [];
+  return busy.data.calendars?.[process.env.GOOGLE_CALENDAR_ID || 'primary']?.busy || [];
+}
+
+function businessWindow(day) {
+  const weekday = new Date(`${day}T12:00:00Z`).getUTCDay();
+  if (!openDays.has(weekday)) return null;
+  return { start: toDateTime(day, openTime[0], openTime[1]), end: toDateTime(day, closeTime[0], closeTime[1]) };
+}
+
+function bufferedBusy(events) {
+  const buffer = bookingBufferMinutes * 60000;
+  return events.map(event => ({ start: new Date(event.start).getTime() - buffer, end: new Date(event.end).getTime() + buffer }));
+}
+
+async function checkAvailability({ date, service, requestedTime = '', technician = '' }) {
+  const detail = serviceDetails(service);
+  const day = date || new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date());
+  const window = businessWindow(day);
+  if (!window) return { date: day, service: detail.label, durationMinutes: detail.durationMinutes, slots: [], reason: 'The salon is closed that day.' };
+  const busy = bufferedBusy(await calendarBusy(window.start, window.end));
   const candidateSlots = [];
-  for (let minutes = 0; minutes + detail.durationMinutes <= 540; minutes += 15) {
-    const slotStart = new Date(start.getTime() + minutes * 60000);
+  const windowMinutes = (window.end.getTime() - window.start.getTime()) / 60000;
+  for (let minutes = 0; minutes + detail.durationMinutes <= windowMinutes; minutes += 15) {
+    const slotStart = new Date(window.start.getTime() + minutes * 60000);
     const slotEnd = new Date(slotStart.getTime() + detail.durationMinutes * 60000);
-    const overlaps = events.some((event) => new Date(event.start) < slotEnd && new Date(event.end) > slotStart);
+    const overlaps = busy.some(event => event.start < slotEnd.getTime() && event.end > slotStart.getTime());
     if (!overlaps) candidateSlots.push({ start: slotStart.toISOString(), end: slotEnd.toISOString(), technician: technician || 'available team member' });
   }
-  const positions = candidateSlots.length <= 3
+  const requestedMinutes = /^\d{1,2}:\d{2}$/.test(requestedTime) ? requestedTime.split(':').map(Number).reduce((hour, minute) => hour * 60 + minute) : null;
+  if (requestedMinutes !== null) candidateSlots.sort((a, b) => Math.abs(new Date(a.start).getHours() * 60 + new Date(a.start).getMinutes() - requestedMinutes) - Math.abs(new Date(b.start).getHours() * 60 + new Date(b.start).getMinutes() - requestedMinutes));
+  const positions = requestedMinutes !== null
+    ? candidateSlots.slice(0, 3).map((_, index) => index)
+    : candidateSlots.length <= 3
     ? candidateSlots.map((_, index) => index)
     : [...new Set([0, Math.round((candidateSlots.length - 1) / 2), candidateSlots.length - 1])];
   return { date: day, service: detail.label, durationMinutes: detail.durationMinutes, slots: positions.map(index => candidateSlots[index]) };
+}
+
+async function slotIsAvailable(startValue, endValue) {
+  const start = new Date(startValue);
+  const end = new Date(endValue);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) return false;
+  const busy = bufferedBusy(await calendarBusy(new Date(start.getTime() - bookingBufferMinutes * 60000), new Date(end.getTime() + bookingBufferMinutes * 60000)));
+  return !busy.some(event => event.start < end.getTime() && event.end > start.getTime());
 }
 
 async function calendarEvents(date) {
@@ -248,8 +283,9 @@ async function readSheetInfo() {
   } catch { return null; }
 }
 
-async function logBooking(booking) {
+async function completeBooking(booking) {
   const { calendar: cal, sheets } = await calendar();
+  if (!(await slotIsAvailable(booking.start, booking.end))) throw new Error('That opening was just taken. I will check the next closest time.');
   const calendarId = process.env.GOOGLE_CALENDAR_ID || 'primary';
   const event = await cal.events.insert({ calendarId, requestBody: {
     summary: `${booking.customerName} · ${booking.service}`,
@@ -257,16 +293,16 @@ async function logBooking(booking) {
     start: { dateTime: booking.start, timeZone: timezone },
     end: { dateTime: booking.end, timeZone: timezone }
   } });
-  let sheetId;
-  let sheetError = '';
-  try {
-    sheetId = await ensureBookingSheet(sheets);
-    await sheets.spreadsheets.values.append({ spreadsheetId: sheetId, range: 'Bookings!A:H', valueInputOption: 'USER_ENTERED', requestBody: { values: [[new Date().toISOString(), booking.customerName, booking.phone, booking.service, booking.technician || 'available team member', booking.start, event.data.id, booking.notes || '']] } });
-  } catch (error) {
-    sheetError = error.message;
-    console.error(`Booking log: ${sheetError}`);
-  }
-  return { ...booking, eventId: event.data.id, sheetId, sheetError, sheetUrl: sheetId ? `https://docs.google.com/spreadsheets/d/${sheetId}/edit` : '' };
+  const confirmation = `You’re booked at ${salonName} for ${booking.service} on ${new Date(booking.start).toLocaleString('en-US', { timeZone: timezone, dateStyle: 'full', timeStyle: 'short' })}. See you soon!\n\nAddress: ${salonAddress}`;
+  const [sheetResult, smsResult, ownerResult] = await Promise.allSettled([
+    (async () => { const sheetId = await ensureBookingSheet(sheets); await sheets.spreadsheets.values.append({ spreadsheetId: sheetId, range: 'Bookings!A:H', valueInputOption: 'USER_ENTERED', requestBody: { values: [[new Date().toISOString(), booking.customerName, booking.phone, booking.service, booking.technician || 'available team member', booking.start, event.data.id, booking.notes || '']] } }); return { sheetId, sheetUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/edit` }; })(),
+    sendText(booking.phone, confirmation),
+    process.env.SALON_OWNER_PHONE ? sendText(process.env.SALON_OWNER_PHONE, `Mika booked ${booking.customerName} for ${booking.service} on ${new Date(booking.start).toLocaleString('en-US', { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' })}.`) : Promise.resolve({ sent: false, skipped: true })
+  ]);
+  const sheet = sheetResult.status === 'fulfilled' ? sheetResult.value : { sheetError: sheetResult.reason?.message || 'Sheet write failed' };
+  const sms = smsResult.status === 'fulfilled' ? smsResult.value : { sent: false, error: smsResult.reason?.message || 'SMS failed' };
+  const owner = ownerResult.status === 'fulfilled' ? ownerResult.value : { sent: false, error: ownerResult.reason?.message || 'Owner notification failed' };
+  return { ...booking, eventId: event.data.id, calendarBooked: true, sheetUrl: sheet.sheetUrl || '', sheetStatus: sheet.sheetUrl ? 'saved' : 'failed', sheetError: sheet.sheetError || '', confirmationSent: sms.sent, smsStatus: sms.sent ? 'sent' : 'failed', smsError: sms.error || '', ownerStatus: owner.sent ? 'sent' : 'skipped' };
 }
 
 async function ensureBookingSheet(sheets) {
@@ -310,26 +346,14 @@ const receptionistPrompt = async () => {
 
 function toolDefinitions() {
   return [
-    { type: 'function', name: 'check_availability', description: 'Look up open appointment slots in the salon Google Calendar. Return real openings spread across the day when possible.', parameters: { type: 'object', properties: { date: { type: 'string', description: 'Requested date in YYYY-MM-DD.' }, service: { type: 'string' }, technician: { type: 'string' } }, required: ['date', 'service'] } },
-    { type: 'function', name: 'book_appointment', description: 'Create the confirmed appointment in Google Calendar and the booking log in Google Sheets. The caller phone comes from Twilio automatically.', parameters: { type: 'object', properties: { customerName: { type: 'string' }, phone: { type: 'string' }, service: { type: 'string' }, technician: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' }, notes: { type: 'string' } }, required: ['customerName', 'service', 'start', 'end'] } }
+    { type: 'function', name: 'check_availability', description: 'The only way to know appointment availability. Check the connected salon Google Calendar using salon hours, service duration, and a 15-minute buffer. Never invent a slot.', parameters: { type: 'object', properties: { date: { type: 'string', description: 'Requested date in YYYY-MM-DD.' }, service: { type: 'string' }, requestedTime: { type: 'string', description: 'Optional requested local time in HH:MM.' }, technician: { type: 'string' } }, required: ['date', 'service'] } },
+    { type: 'function', name: 'complete_booking', description: 'After the caller chooses a returned slot, recheck it and create the Calendar event, write the Google Sheet row, and send the Twilio SMS confirmation. The caller phone comes from Twilio automatically.', parameters: { type: 'object', properties: { customerName: { type: 'string' }, phone: { type: 'string' }, service: { type: 'string' }, technician: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' }, notes: { type: 'string' } }, required: ['customerName', 'service', 'start', 'end'] } }
   ];
 }
 
 async function handleTool(name, args) {
   if (name === 'check_availability') return checkAvailability(args);
-  if (name === 'book_appointment') {
-    const booking = await logBooking(args);
-    const confirmation = `You’re booked at ${salonName} for ${args.service} on ${new Date(args.start).toLocaleString('en-US', { timeZone: timezone, dateStyle: 'full', timeStyle: 'short' })}. See you soon!\n\nAddress: ${salonAddress}`;
-    const customerText = await sendText(args.phone, confirmation);
-    const customerEmail = await sendEmail(args.email, `Your ${salonName} appointment`, confirmation);
-    const ownerText = await sendText(process.env.SALON_OWNER_PHONE, `Mika booked ${args.customerName} for ${args.service} on ${new Date(args.start).toLocaleString('en-US', { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' })}. Technician: ${args.technician || 'available team member'}.`);
-    await appendLog({ type: 'booking', customer: args.customerName, phone: args.phone, service: args.service, start: args.start, technician: args.technician || 'available team member', notes: args.notes || '', calendarEventId: booking.eventId, sheetStatus: booking.sheetError ? 'failed' : 'saved', sheetError: booking.sheetError || '', notifications: { customerText, customerEmail, ownerText } });
-    await logActivityToSheet({ type: 'booking', customer: args.customerName, service: args.service, status: 'booked', channel: 'calendar', details: booking.eventId });
-    await logActivityToSheet({ type: 'customer confirmation', customer: args.customerName, service: args.service, status: customerText.sent ? 'sent' : 'blocked', channel: 'sms', details: customerText.errorCode || '' });
-    await logActivityToSheet({ type: 'customer confirmation', customer: args.customerName, service: args.service, status: customerEmail.sent ? 'sent' : 'not configured', channel: 'email', details: customerEmail.error || '' });
-    await logActivityToSheet({ type: 'owner notification', customer: args.customerName, service: args.service, status: ownerText.sent ? 'sent' : 'blocked', channel: 'sms', details: ownerText.errorCode || '' });
-    return { ...booking, calendarBooked: true, confirmationSent: customerText.sent || customerEmail.sent, sheetUrl: booking.sheetUrl };
-  }
+  if (name === 'complete_booking') { const booking = await completeBooking(args); await appendLog({ type: 'booking', customer: args.customerName, phone: args.phone, service: args.service, start: args.start, technician: args.technician || 'available team member', notes: args.notes || '', calendarEventId: booking.eventId, sheetStatus: booking.sheetStatus, sheetError: booking.sheetError, smsStatus: booking.smsStatus, smsError: booking.smsError }); return booking; }
   return { error: 'Unknown tool.' };
 }
 
