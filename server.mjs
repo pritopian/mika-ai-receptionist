@@ -238,6 +238,12 @@ async function logBooking(booking) {
     start: { dateTime: booking.start, timeZone: timezone },
     end: { dateTime: booking.end, timeZone: timezone }
   } });
+  const sheetId = await ensureBookingSheet(sheets);
+  await sheets.spreadsheets.values.append({ spreadsheetId: sheetId, range: 'Bookings!A:G', valueInputOption: 'USER_ENTERED', requestBody: { values: [[new Date().toISOString(), booking.customerName, booking.phone, booking.service, booking.technician || 'available team member', booking.start, event.data.id]] } });
+  return { ...booking, eventId: event.data.id, sheetId, sheetUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/edit` };
+}
+
+async function ensureBookingSheet(sheets) {
   const sheetIdFile = path.join(dataDir, 'sheet.json');
   let sheetId;
   try { sheetId = JSON.parse(await fs.readFile(sheetIdFile, 'utf8')).spreadsheetId; } catch {}
@@ -247,8 +253,7 @@ async function logBooking(booking) {
     await fs.writeFile(sheetIdFile, JSON.stringify({ spreadsheetId: sheetId }));
     await sheets.spreadsheets.values.update({ spreadsheetId: sheetId, range: 'Bookings!A1:G1', valueInputOption: 'RAW', requestBody: { values: [['Date', 'Customer', 'Phone', 'Service', 'Technician', 'Start', 'Calendar event']] } });
   }
-  await sheets.spreadsheets.values.append({ spreadsheetId: sheetId, range: 'Bookings!A:G', valueInputOption: 'USER_ENTERED', requestBody: { values: [[new Date().toISOString(), booking.customerName, booking.phone, booking.service, booking.technician || 'available team member', booking.start, event.data.id]] } });
-  return { ...booking, eventId: event.data.id, sheetId, sheetUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/edit` };
+  return sheetId;
 }
 
 async function sendText(to, body) {
@@ -362,6 +367,8 @@ const server = http.createServer(async (req, res) => {
       const auth = oauthClient(requestRedirectUri(req));
       const { tokens } = await auth.getToken(code);
       await fs.writeFile(path.join(dataDir, 'google-token.json'), JSON.stringify(tokens));
+      auth.setCredentials(tokens);
+      await ensureBookingSheet(google.sheets({ version: 'v4', auth }));
       res.writeHead(302, { location: '/dashboard.html?google=connected' }); return res.end();
     }
     if (url.pathname === '/twilio/voice') {
