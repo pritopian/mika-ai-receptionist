@@ -209,15 +209,24 @@ async function checkAvailability({ date, service, gel = false, technician = '' }
   const end = toDateTime(day, 19, 0);
   const busy = await cal.freebusy.query({ requestBody: { timeMin: start.toISOString(), timeMax: end.toISOString(), items: [{ id: process.env.GOOGLE_CALENDAR_ID || 'primary' }] } });
   const events = busy.data.calendars?.[process.env.GOOGLE_CALENDAR_ID || 'primary']?.busy || [];
-  const slots = [];
+  const candidateSlots = [];
   for (let minutes = 0; minutes + detail.durationMinutes <= 540; minutes += 15) {
     const slotStart = new Date(start.getTime() + minutes * 60000);
     const slotEnd = new Date(slotStart.getTime() + detail.durationMinutes * 60000);
     const overlaps = events.some((event) => new Date(event.start) < slotEnd && new Date(event.end) > slotStart);
-    if (!overlaps) slots.push({ start: slotStart.toISOString(), end: slotEnd.toISOString(), technician: technician || 'available team member' });
-    if (slots.length === 4) break;
+    if (!overlaps) candidateSlots.push({ start: slotStart.toISOString(), end: slotEnd.toISOString(), technician: technician || 'available team member' });
   }
-  return { date: day, service: detail.label, durationMinutes: detail.durationMinutes, slots };
+  const positions = candidateSlots.length <= 3
+    ? candidateSlots.map((_, index) => index)
+    : [...new Set([0, Math.round((candidateSlots.length - 1) / 2), candidateSlots.length - 1])];
+  return { date: day, service: detail.label, durationMinutes: detail.durationMinutes, slots: positions.map(index => candidateSlots[index]) };
+}
+
+async function readSheetInfo() {
+  try {
+    const { spreadsheetId } = JSON.parse(await fs.readFile(path.join(dataDir, 'sheet.json'), 'utf8'));
+    return spreadsheetId ? { spreadsheetId, url: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit` } : null;
+  } catch { return null; }
 }
 
 async function logBooking(booking) {
@@ -239,7 +248,7 @@ async function logBooking(booking) {
     await sheets.spreadsheets.values.update({ spreadsheetId: sheetId, range: 'Bookings!A1:G1', valueInputOption: 'RAW', requestBody: { values: [['Date', 'Customer', 'Phone', 'Service', 'Technician', 'Start', 'Calendar event']] } });
   }
   await sheets.spreadsheets.values.append({ spreadsheetId: sheetId, range: 'Bookings!A:G', valueInputOption: 'USER_ENTERED', requestBody: { values: [[new Date().toISOString(), booking.customerName, booking.phone, booking.service, booking.technician || 'available team member', booking.start, event.data.id]] } });
-  return { ...booking, eventId: event.data.id, sheetId };
+  return { ...booking, eventId: event.data.id, sheetId, sheetUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/edit` };
 }
 
 async function sendText(to, body) {
@@ -270,7 +279,7 @@ const receptionistPrompt = async () => {
 
 function toolDefinitions() {
   return [
-    { type: 'function', name: 'check_availability', description: 'Look up open appointment slots in the salon Google Calendar.', parameters: { type: 'object', properties: { date: { type: 'string', description: 'Requested date in YYYY-MM-DD.' }, service: { type: 'string' }, gel: { type: 'boolean' }, technician: { type: 'string' } }, required: ['date', 'service'] } },
+    { type: 'function', name: 'check_availability', description: 'Look up open appointment slots in the salon Google Calendar. Return real openings spread across the day when possible.', parameters: { type: 'object', properties: { date: { type: 'string', description: 'Requested date in YYYY-MM-DD.' }, service: { type: 'string' }, technician: { type: 'string' } }, required: ['date', 'service'] } },
     { type: 'function', name: 'book_appointment', description: 'Create the confirmed appointment in Google Calendar and the booking log in Google Sheets.', parameters: { type: 'object', properties: { customerName: { type: 'string' }, phone: { type: 'string' }, service: { type: 'string' }, technician: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' } }, required: ['customerName', 'phone', 'service', 'start', 'end'] } }
   ];
 }
@@ -288,7 +297,7 @@ async function handleTool(name, args) {
     await logActivityToSheet({ type: 'customer confirmation', customer: args.customerName, service: args.service, status: customerText.sent ? 'sent' : 'blocked', channel: 'sms', details: customerText.errorCode || '' });
     await logActivityToSheet({ type: 'customer confirmation', customer: args.customerName, service: args.service, status: customerEmail.sent ? 'sent' : 'not configured', channel: 'email', details: customerEmail.error || '' });
     await logActivityToSheet({ type: 'owner notification', customer: args.customerName, service: args.service, status: ownerText.sent ? 'sent' : 'blocked', channel: 'sms', details: ownerText.errorCode || '' });
-    return { ...booking, confirmationSent: customerText.sent || customerEmail.sent };
+    return { ...booking, confirmationSent: customerText.sent || customerEmail.sent, sheetUrl: booking.sheetUrl };
   }
   return { error: 'Unknown tool.' };
 }
@@ -296,7 +305,7 @@ async function handleTool(name, args) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
-    if (url.pathname === '/api/status') { const profile = await activeSalonProfile(); return json(res, 200, { salonName: profile.name || salonName, address: profile.address || salonAddress, phone: process.env.TWILIO_PHONE_NUMBER || '', googleConnected: Boolean(await readToken()), profile }); }
+    if (url.pathname === '/api/status') { const profile = await activeSalonProfile(); return json(res, 200, { salonName: profile.name || salonName, address: profile.address || salonAddress, phone: process.env.TWILIO_PHONE_NUMBER || '', googleConnected: Boolean(await readToken()), sheet: await readSheetInfo(), profile }); }
     if (url.pathname === '/api/logs') return json(res, 200, await readLogs());
     if (url.pathname === '/api/login' && req.method === 'POST') {
       const { email } = await readBody(req);
