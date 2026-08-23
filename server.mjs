@@ -108,9 +108,10 @@ function extractSalonProfile(html, website) {
 
 async function activeSalonProfile() {
   const profile = await readProfile();
-  if (!profile.website && /paua/i.test(salonName)) {
-    globalThis.__mikaProfile = defaultPauaProfile;
-    return defaultPauaProfile;
+  if (/paua/i.test(salonName)) {
+    const activePaua = { ...defaultPauaProfile, ...profile, services: profile.services?.length ? profile.services : pauaServices, address: profile.address || defaultPauaProfile.address, phone: profile.phone || defaultPauaProfile.phone };
+    globalThis.__mikaProfile = activePaua;
+    return activePaua;
   }
   const active = profile.status === 'confirmed' ? profile : { ...profile, name: profile.name || salonName, address: profile.address || salonAddress };
   globalThis.__mikaProfile = active;
@@ -141,10 +142,16 @@ const readBody = async (req) => {
   return body ? JSON.parse(body) : {};
 };
 
-const oauthClient = () => new google.auth.OAuth2(
+const requestRedirectUri = req => {
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  const protocol = String(req.headers['x-forwarded-proto'] || (host?.includes('localhost') ? 'http' : 'https')).split(',')[0];
+  return `${protocol}://${host}/api/google/callback`;
+};
+
+const oauthClient = (redirectUri = process.env.GOOGLE_REDIRECT_URI) => new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_URI
+  redirectUri
 );
 
 async function readToken() {
@@ -331,14 +338,14 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'content-type': 'text/xml' }); return res.end(twiml.toString());
     }
     if (url.pathname === '/api/google/connect') {
-      const auth = oauthClient();
+      const auth = oauthClient(requestRedirectUri(req));
       const consentUrl = auth.generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: ['https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/spreadsheets'] });
       res.writeHead(302, { location: consentUrl }); return res.end();
     }
     if (url.pathname === '/api/google/callback') {
       const code = url.searchParams.get('code');
       if (!code) return json(res, 400, { error: 'Start Google connection at /api/google/connect. This callback page cannot be opened directly.' });
-      const auth = oauthClient();
+      const auth = oauthClient(requestRedirectUri(req));
       const { tokens } = await auth.getToken(code);
       await fs.writeFile(path.join(dataDir, 'google-token.json'), JSON.stringify(tokens));
       res.writeHead(302, { location: '/dashboard.html?google=connected' }); return res.end();

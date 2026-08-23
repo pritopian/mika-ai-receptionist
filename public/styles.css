@@ -21,7 +21,7 @@ h2 { font-size:22px; letter-spacing:-.035em; font-weight:450; margin:0; }
 label { display:block; color:#777; font-size:13px; margin:32px 0 8px; }
 input { min-width:0; flex:1; border:1px solid #ddd; border-radius:10px; padding:14px 15px; font:inherit; font-size:15px; outline:none; }
 input:focus { border-color:#999; box-shadow:0 0 0 3px #f1f1f1; }
-button, .button { border:0; border-radius:9px; background:var(--ink); color:white; padding:14px 17px; font:inherit; font-size:14px; cursor:pointer; text-decoration:none; white-space:nowrap; }
+button, .button { display:inline-flex; align-items:center; justify-content:center; border:0; border-radius:9px; background:var(--ink); color:white; padding:14px 17px; font:inherit; font-size:14px; cursor:pointer; text-decoration:none; white-space:nowrap; max-width:100%; }
 .secondary { background:#f4f4f2; color:var(--ink); }
 .hint, .small { color:#929292; font-size:13px; line-height:1.5; margin:11px 0 0; }
 .divider { height:1px; background:var(--line); margin:26px 0; }
