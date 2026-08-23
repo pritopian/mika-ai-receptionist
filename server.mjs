@@ -338,6 +338,31 @@ async function ensureBookingSheet(sheets) {
   return sheetId;
 }
 
+async function syncCalendarBookingsToSheet(sheets, spreadsheetId) {
+  const now = Date.now();
+  const { calendar: cal } = await calendar();
+  const events = await cal.events.list({ calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary', timeMin: new Date(now - 90 * 86400000).toISOString(), timeMax: new Date(now + 365 * 86400000).toISOString(), singleEvents: true, orderBy: 'startTime', maxResults: 2500 });
+  const existing = await sheets.spreadsheets.values.get({ spreadsheetId, range: 'Bookings!A:H' });
+  const rows = existing.data.values || [];
+  const existingEventIds = new Set(rows.slice(1).map(row => row[6]).filter(Boolean));
+  const missing = (events.data.items || []).filter(event => event.status !== 'cancelled' && String(event.description || '').includes('Booked by Mika AI receptionist') && !existingEventIds.has(event.id));
+  if (!missing.length) return 0;
+  const values = missing.map(event => {
+    const description = String(event.description || '');
+    const summary = String(event.summary || '');
+    const separator = summary.indexOf(' · ');
+    const customer = separator >= 0 ? summary.slice(0, separator) : summary;
+    const service = separator >= 0 ? summary.slice(separator + 3) : '';
+    const phone = description.match(/Customer phone:\s*([^\.]+)/i)?.[1]?.trim() || '';
+    const technician = description.match(/Technician:\s*([^\.]+)/i)?.[1]?.trim() || 'available team member';
+    const notes = description.match(/Notes:\s*([^\.]+)$/i)?.[1]?.trim() || '';
+    return [event.created || new Date().toISOString(), customer, phone, service, technician, event.start?.dateTime || event.start?.date || '', event.id, notes];
+  });
+  await sheets.spreadsheets.values.update({ spreadsheetId, range: 'Bookings!A1:H1', valueInputOption: 'RAW', requestBody: { values: [['Created', 'Customer', 'Phone', 'Service', 'Technician', 'Start', 'Calendar event', 'Notes']] } });
+  await sheets.spreadsheets.values.append({ spreadsheetId, range: 'Bookings!A:H', valueInputOption: 'USER_ENTERED', requestBody: { values } });
+  return values.length;
+}
+
 async function sendText(to, body) {
   if (!twilioClient || !to || !process.env.TWILIO_PHONE_NUMBER) return { sent: false };
   try {
@@ -408,6 +433,7 @@ const server = http.createServer(async (req, res) => {
       const info = await readSheetInfo();
       if (!info) return json(res, 404, { error: 'The booking Sheet is not available yet.' });
       const { sheets } = await calendar();
+      await syncCalendarBookingsToSheet(sheets, info.spreadsheetId);
       const response = await sheets.spreadsheets.values.get({ spreadsheetId: info.spreadsheetId, range: 'Bookings!A:G' });
       return json(res, 200, { ...info, rows: response.data.values || [] });
     }
