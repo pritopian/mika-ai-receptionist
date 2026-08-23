@@ -43,7 +43,7 @@ const pauaServices = [
   { category: 'Repairs', name: 'Fix Nail / Add a tip', price: '$5', duration: '5 min' }
 ];
 
-const isPauaBooksyPage = website => /booksy\.com\/.*(?:387858|paua-beauty-lounge)/i.test(website || '');
+const isPauaBooksyPage = website => /(?:pauabeautylounge|paua-beauty-lounge|387858)/i.test(website || '');
 
 await fs.mkdir(dataDir, { recursive: true });
 const promptTemplate = await fs.readFile(path.join(root, 'REALTIME_PROMPT.md'), 'utf8').catch(() => 'You are Mika, a warm AI receptionist for {{SALON_NAME}}.');
@@ -101,7 +101,7 @@ function extractSalonProfile(html, website) {
   const description = decodeHtml(html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)/i)?.[1]?.trim() || '');
   const phone = business.telephone || html.match(/(?:tel:|phone[^>]*>)([^<]+)/i)?.[1]?.trim() || '';
   if (isPauaBooksyPage(website)) services = pauaServices;
-  return { website, name: isPauaBooksyPage(website) ? 'Paua Beauty Lounge' : business.name || title.split('|')[0].split('-')[0].trim() || salonName, title, description, address: address || (isPauaBooksyPage(website) ? '1455 Powell St, San Francisco, CA 94133' : ''), phone, hours, services, status: 'needs_review', importedAt: new Date().toISOString() };
+  return { website, name: isPauaBooksyPage(website) ? 'Paua Beauty Lounge' : business.name || title.split('|')[0].split('-')[0].trim() || salonName, title, description, address: address || (isPauaBooksyPage(website) ? '1455 Powell St, San Francisco, CA 94133' : ''), phone: phone || (isPauaBooksyPage(website) ? '(415) 525-4766' : ''), hours, services, status: 'needs_review', importedAt: new Date().toISOString() };
 }
 
 async function activeSalonProfile() {
