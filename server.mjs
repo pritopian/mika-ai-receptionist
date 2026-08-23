@@ -15,7 +15,6 @@ const host = process.env.HOST || '0.0.0.0';
 const salonName = process.env.SALON_NAME || 'the salon';
 const salonAddress = process.env.SALON_ADDRESS || '';
 const timezone = process.env.SALON_TIMEZONE || 'America/Los_Angeles';
-const publicBaseUrl = process.env.PUBLIC_BASE_URL || '';
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
@@ -46,6 +45,12 @@ const pauaServices = [
 const defaultPauaProfile = { website: 'https://pauabeautylounge.booksy.com/', name: 'Paua Beauty Lounge', title: 'Paua Beauty Lounge', description: 'Nail salon appointments handled by Mika.', address: '1455 Powell St, San Francisco, CA 94133', phone: '(415) 525-4766', hours: '', services: pauaServices, status: 'confirmed' };
 
 const isPauaBooksyPage = website => /(?:pauabeautylounge|paua-beauty-lounge|387858)/i.test(website || '');
+
+function requestPublicBaseUrl(req) {
+  const forwardedHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || (forwardedHost.includes('localhost') ? 'http' : 'https')).split(',')[0].trim();
+  return `${forwardedProto}://${forwardedHost}`.replace(/\/$/, '');
+}
 
 await fs.mkdir(dataDir, { recursive: true });
 const promptTemplate = await fs.readFile(path.join(root, 'REALTIME_PROMPT.md'), 'utf8').catch(() => 'You are Mika, a warm AI receptionist for {{SALON_NAME}}.');
@@ -353,7 +358,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/twilio/voice') {
       const twiml = new twilio.twiml.VoiceResponse();
       const connect = twiml.connect();
-      const streamBase = publicBaseUrl ? publicBaseUrl.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:') : `wss://${req.headers.host}`;
+      const streamBase = requestPublicBaseUrl(req).replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
       connect.stream({ url: `${streamBase}/twilio/media` });
       res.writeHead(200, { 'content-type': 'text/xml' }); return res.end(twiml.toString());
     }
