@@ -144,7 +144,9 @@ const json = (res, status, body) => {
 const readBody = async (req) => {
   let body = '';
   for await (const chunk of req) body += chunk;
-  return body ? JSON.parse(body) : {};
+  if (!body) return {};
+  if (String(req.headers['content-type'] || '').includes('application/x-www-form-urlencoded')) return Object.fromEntries(new URLSearchParams(body));
+  return JSON.parse(body);
 };
 
 const requestRedirectUri = req => {
@@ -222,6 +224,23 @@ async function checkAvailability({ date, service, gel = false, technician = '' }
   return { date: day, service: detail.label, durationMinutes: detail.durationMinutes, slots: positions.map(index => candidateSlots[index]) };
 }
 
+async function calendarEvents(date) {
+  const { calendar: cal } = await calendar();
+  const day = date || new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date());
+  const start = toDateTime(day, 0, 0);
+  const end = new Date(start.getTime() + 24 * 60 * 60000);
+  const response = await cal.events.list({ calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary', timeMin: start.toISOString(), timeMax: end.toISOString(), singleEvents: true, orderBy: 'startTime', maxResults: 100 });
+  return { date: day, events: (response.data.items || []).map(event => ({ id: event.id, summary: event.summary || 'Busy', description: event.description || '', start: event.start?.dateTime || event.start?.date, end: event.end?.dateTime || event.end?.date, status: event.status })) };
+}
+
+async function blockCalendarTime({ start, end, summary = 'Blocked time', notes = '' }) {
+  if (!start || !end || new Date(end) <= new Date(start)) throw new Error('Choose a valid start and end time.');
+  const { calendar: cal } = await calendar();
+  const event = await cal.events.insert({ calendarId: process.env.GOOGLE_CALENDAR_ID || 'primary', requestBody: { summary, description: notes, start: { dateTime: start, timeZone: timezone }, end: { dateTime: end, timeZone: timezone } } });
+  await appendLog({ type: 'blocked_time', start, end, summary, notes, calendarEventId: event.data.id });
+  return { id: event.data.id, summary, notes, start, end };
+}
+
 async function readSheetInfo() {
   try {
     const { spreadsheetId } = JSON.parse(await fs.readFile(path.join(dataDir, 'sheet.json'), 'utf8'));
@@ -234,7 +253,7 @@ async function logBooking(booking) {
   const calendarId = process.env.GOOGLE_CALENDAR_ID || 'primary';
   const event = await cal.events.insert({ calendarId, requestBody: {
     summary: `${booking.customerName} · ${booking.service}`,
-    description: `Booked by Mika AI receptionist. Customer phone: ${booking.phone}. Technician: ${booking.technician || 'available team member'}.`,
+    description: `Booked by Mika AI receptionist. Customer phone: ${booking.phone}. Technician: ${booking.technician || 'available team member'}. Notes: ${booking.notes || 'None'}`,
     start: { dateTime: booking.start, timeZone: timezone },
     end: { dateTime: booking.end, timeZone: timezone }
   } });
@@ -242,7 +261,7 @@ async function logBooking(booking) {
   let sheetError = '';
   try {
     sheetId = await ensureBookingSheet(sheets);
-    await sheets.spreadsheets.values.append({ spreadsheetId: sheetId, range: 'Bookings!A:G', valueInputOption: 'USER_ENTERED', requestBody: { values: [[new Date().toISOString(), booking.customerName, booking.phone, booking.service, booking.technician || 'available team member', booking.start, event.data.id]] } });
+    await sheets.spreadsheets.values.append({ spreadsheetId: sheetId, range: 'Bookings!A:H', valueInputOption: 'USER_ENTERED', requestBody: { values: [[new Date().toISOString(), booking.customerName, booking.phone, booking.service, booking.technician || 'available team member', booking.start, event.data.id, booking.notes || '']] } });
   } catch (error) {
     sheetError = error.message;
     console.error(`Booking log: ${sheetError}`);
@@ -258,7 +277,7 @@ async function ensureBookingSheet(sheets) {
     const created = await sheets.spreadsheets.create({ requestBody: { properties: { title: `${salonName} · Mika bookings` }, sheets: [{ properties: { title: 'Bookings' } }] } });
     sheetId = created.data.spreadsheetId;
     await fs.writeFile(sheetIdFile, JSON.stringify({ spreadsheetId: sheetId }));
-    await sheets.spreadsheets.values.update({ spreadsheetId: sheetId, range: 'Bookings!A1:G1', valueInputOption: 'RAW', requestBody: { values: [['Date', 'Customer', 'Phone', 'Service', 'Technician', 'Start', 'Calendar event']] } });
+    await sheets.spreadsheets.values.update({ spreadsheetId: sheetId, range: 'Bookings!A1:H1', valueInputOption: 'RAW', requestBody: { values: [['Created', 'Customer', 'Phone', 'Service', 'Technician', 'Start', 'Calendar event', 'Notes']] } });
   }
   return sheetId;
 }
@@ -292,7 +311,7 @@ const receptionistPrompt = async () => {
 function toolDefinitions() {
   return [
     { type: 'function', name: 'check_availability', description: 'Look up open appointment slots in the salon Google Calendar. Return real openings spread across the day when possible.', parameters: { type: 'object', properties: { date: { type: 'string', description: 'Requested date in YYYY-MM-DD.' }, service: { type: 'string' }, technician: { type: 'string' } }, required: ['date', 'service'] } },
-    { type: 'function', name: 'book_appointment', description: 'Create the confirmed appointment in Google Calendar and the booking log in Google Sheets.', parameters: { type: 'object', properties: { customerName: { type: 'string' }, phone: { type: 'string' }, service: { type: 'string' }, technician: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' } }, required: ['customerName', 'phone', 'service', 'start', 'end'] } }
+    { type: 'function', name: 'book_appointment', description: 'Create the confirmed appointment in Google Calendar and the booking log in Google Sheets. The caller phone comes from Twilio automatically.', parameters: { type: 'object', properties: { customerName: { type: 'string' }, phone: { type: 'string' }, service: { type: 'string' }, technician: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' }, notes: { type: 'string' } }, required: ['customerName', 'service', 'start', 'end'] } }
   ];
 }
 
@@ -304,7 +323,7 @@ async function handleTool(name, args) {
     const customerText = await sendText(args.phone, confirmation);
     const customerEmail = await sendEmail(args.email, `Your ${salonName} appointment`, confirmation);
     const ownerText = await sendText(process.env.SALON_OWNER_PHONE, `Mika booked ${args.customerName} for ${args.service} on ${new Date(args.start).toLocaleString('en-US', { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' })}. Technician: ${args.technician || 'available team member'}.`);
-    await appendLog({ type: 'booking', customer: args.customerName, service: args.service, start: args.start, technician: args.technician || 'available team member', calendarEventId: booking.eventId, sheetStatus: booking.sheetError ? 'failed' : 'saved', sheetError: booking.sheetError || '', notifications: { customerText, customerEmail, ownerText } });
+    await appendLog({ type: 'booking', customer: args.customerName, phone: args.phone, service: args.service, start: args.start, technician: args.technician || 'available team member', notes: args.notes || '', calendarEventId: booking.eventId, sheetStatus: booking.sheetError ? 'failed' : 'saved', sheetError: booking.sheetError || '', notifications: { customerText, customerEmail, ownerText } });
     await logActivityToSheet({ type: 'booking', customer: args.customerName, service: args.service, status: 'booked', channel: 'calendar', details: booking.eventId });
     await logActivityToSheet({ type: 'customer confirmation', customer: args.customerName, service: args.service, status: customerText.sent ? 'sent' : 'blocked', channel: 'sms', details: customerText.errorCode || '' });
     await logActivityToSheet({ type: 'customer confirmation', customer: args.customerName, service: args.service, status: customerEmail.sent ? 'sent' : 'not configured', channel: 'email', details: customerEmail.error || '' });
@@ -329,6 +348,15 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { salonName: profile.name || salonName, address: profile.address || salonAddress, phone: process.env.TWILIO_PHONE_NUMBER || '', googleConnected, sheet, sheetError, profile });
     }
     if (url.pathname === '/api/logs') return json(res, 200, await readLogs());
+    if (url.pathname === '/api/calendar/events') return json(res, 200, await calendarEvents(url.searchParams.get('date')));
+    if (url.pathname === '/api/calendar/block' && req.method === 'POST') return json(res, 200, await blockCalendarTime(await readBody(req)));
+    if (url.pathname === '/api/sheet/rows') {
+      const info = await readSheetInfo();
+      if (!info) return json(res, 404, { error: 'The booking Sheet is not available yet.' });
+      const { sheets } = await calendar();
+      const response = await sheets.spreadsheets.values.get({ spreadsheetId: info.spreadsheetId, range: 'Bookings!A:G' });
+      return json(res, 200, { ...info, rows: response.data.values || [] });
+    }
     if (url.pathname === '/api/login' && req.method === 'POST') {
       const { email } = await readBody(req);
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || ''))) return json(res, 400, { error: 'Enter a valid email address.' });
@@ -389,10 +417,12 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(302, { location: '/dashboard.html?google=connected' }); return res.end();
     }
     if (url.pathname === '/twilio/voice') {
+      const body = req.method === 'POST' ? await readBody(req).catch(() => ({})) : {};
       const twiml = new twilio.twiml.VoiceResponse();
       const connect = twiml.connect();
       const streamBase = requestPublicBaseUrl(req).replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
-      connect.stream({ url: `${streamBase}/twilio/media` });
+      const stream = connect.stream({ url: `${streamBase}/twilio/media` });
+      if (body.From) stream.parameter({ name: 'callerPhone', value: body.From });
       res.writeHead(200, { 'content-type': 'text/xml' }); return res.end(twiml.toString());
     }
     const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
@@ -414,22 +444,24 @@ server.on('upgrade', (req, socket, head) => {
 wss.on('connection', (twilioWs) => {
   let streamSid;
   let openaiWs;
+  let callerPhone = '';
   const connectOpenAI = () => {
     openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-mini'}`, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } });
     openaiWs.on('open', async () => {
-      openaiWs.send(JSON.stringify({ type: 'session.update', session: { type: 'realtime', instructions: await receptionistPrompt(), output_modalities: ['audio'], audio: { input: { format: { type: 'audio/pcmu' }, turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 900, create_response: true, interrupt_response: true } }, output: { format: { type: 'audio/pcmu' }, voice: 'marin' } }, tools: toolDefinitions(), tool_choice: 'auto' } }));
+      openaiWs.send(JSON.stringify({ type: 'session.update', session: { type: 'realtime', instructions: await receptionistPrompt(), output_modalities: ['audio'], audio: { input: { format: { type: 'audio/pcmu' }, turn_detection: { type: 'server_vad', threshold: 0.7, prefix_padding_ms: 400, silence_duration_ms: 1200, create_response: false, interrupt_response: true } }, output: { format: { type: 'audio/pcmu' }, voice: 'marin' } }, tools: toolDefinitions(), tool_choice: 'auto' } }));
       openaiWs.send(JSON.stringify({ type: 'response.create', response: { instructions: `Say exactly: Hi, ${salonName}, how can I help you?` } }));
     });
     openaiWs.on('message', async (raw) => {
       const event = JSON.parse(raw.toString());
       if (event.type === 'response.output_audio.delta' && streamSid) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: event.delta } }));
+      if (event.type === 'input_audio_buffer.speech_stopped') openaiWs.send(JSON.stringify({ type: 'response.create' }));
       if (event.type === 'response.function_call_arguments.done') {
-        try { const output = await handleTool(event.name, JSON.parse(event.arguments)); openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: event.call_id, output: JSON.stringify(output) } })); openaiWs.send(JSON.stringify({ type: 'response.create' })); }
+        try { const args = JSON.parse(event.arguments); const output = await handleTool(event.name, { ...args, phone: args.phone || callerPhone }); openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: event.call_id, output: JSON.stringify(output) } })); openaiWs.send(JSON.stringify({ type: 'response.create' })); }
         catch (error) { openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: event.call_id, output: JSON.stringify({ error: error.message }) } })); openaiWs.send(JSON.stringify({ type: 'response.create' })); }
       }
     });
   };
-  twilioWs.on('message', (raw) => { const event = JSON.parse(raw.toString()); if (event.event === 'start') { streamSid = event.start.streamSid; appendLog({ type: 'call_started', callSid: event.start.callSid || null }); connectOpenAI(); } if (event.event === 'media' && openaiWs?.readyState === WebSocket.OPEN) openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: event.media.payload })); });
+  twilioWs.on('message', (raw) => { const event = JSON.parse(raw.toString()); if (event.event === 'start') { streamSid = event.start.streamSid; callerPhone = event.start.customParameters?.callerPhone || ''; appendLog({ type: 'call_started', callSid: event.start.callSid || null, phone: callerPhone }); connectOpenAI(); } if (event.event === 'media' && openaiWs?.readyState === WebSocket.OPEN) openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: event.media.payload })); });
   twilioWs.on('close', () => openaiWs?.close());
 });
 
