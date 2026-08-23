@@ -43,6 +43,8 @@ const pauaServices = [
   { category: 'Repairs', name: 'Fix Nail / Add a tip', price: '$5', duration: '5 min' }
 ];
 
+const defaultPauaProfile = { website: 'https://pauabeautylounge.booksy.com/', name: 'Paua Beauty Lounge', title: 'Paua Beauty Lounge', description: 'Nail salon appointments handled by Mika.', address: '1455 Powell St, San Francisco, CA 94133', phone: '(415) 525-4766', hours: '', services: pauaServices, status: 'confirmed' };
+
 const isPauaBooksyPage = website => /(?:pauabeautylounge|paua-beauty-lounge|387858)/i.test(website || '');
 
 await fs.mkdir(dataDir, { recursive: true });
@@ -106,6 +108,10 @@ function extractSalonProfile(html, website) {
 
 async function activeSalonProfile() {
   const profile = await readProfile();
+  if (!profile.website && /paua/i.test(salonName)) {
+    globalThis.__mikaProfile = defaultPauaProfile;
+    return defaultPauaProfile;
+  }
   const active = profile.status === 'confirmed' ? profile : { ...profile, name: profile.name || salonName, address: profile.address || salonAddress };
   globalThis.__mikaProfile = active;
   return active;
