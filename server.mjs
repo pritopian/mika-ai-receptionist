@@ -19,6 +19,10 @@ const bookingBufferMinutes = 15;
 const openDays = new Set(String(process.env.SALON_OPEN_DAYS || '1,2,3,4,5,6').split(',').map(value => Number(value.trim())).filter(Number.isInteger));
 const openTime = String(process.env.SALON_OPEN_TIME || '10:00').split(':').map(Number);
 const closeTime = String(process.env.SALON_CLOSE_TIME || '19:00').split(':').map(Number);
+const defaultPauaHours = { 0: ['10:00', '17:30'], 1: ['11:00', '19:30'], 2: ['13:00', '19:30'], 3: ['12:00', '19:30'], 4: ['12:00', '19:30'], 5: ['11:00', '19:30'], 6: ['10:00', '17:30'] };
+const weeklyHours = (() => {
+  try { return JSON.parse(process.env.SALON_HOURS_JSON || ( /paua/i.test(salonName) ? JSON.stringify(defaultPauaHours) : 'null' )); } catch { return null; }
+})();
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
@@ -46,7 +50,7 @@ const pauaServices = [
   { category: 'Repairs', name: 'Fix Nail / Add a tip', price: '$5', duration: '5 min' }
 ];
 
-const defaultPauaProfile = { website: 'https://pauabeautylounge.booksy.com/', name: 'Paua Beauty Lounge', title: 'Paua Beauty Lounge', description: 'Nail salon appointments handled by Mika.', address: '1455 Powell St, San Francisco, CA 94133', phone: '(415) 525-4766', hours: '', services: pauaServices, status: 'confirmed' };
+const defaultPauaProfile = { website: 'https://pauabeautylounge.booksy.com/', name: 'Paua Beauty Lounge', title: 'Paua Beauty Lounge', description: 'Nail salon appointments handled by Mika.', address: '1455 Powell St, San Francisco, CA 94133', phone: '(415) 525-4766', hours: 'Sunday 10 AM-5:30 PM; Monday 11 AM-7:30 PM; Tuesday 1-7:30 PM; Wednesday 12-7:30 PM; Thursday 12-7:30 PM; Friday 11 AM-7:30 PM; Saturday 10 AM-5:30 PM', services: pauaServices, status: 'confirmed' };
 
 const isPauaBooksyPage = website => /(?:pauabeautylounge|paua-beauty-lounge|387858)/i.test(website || '');
 
@@ -232,6 +236,12 @@ async function calendarBusy(start, end) {
 
 function businessWindow(day) {
   const weekday = new Date(`${day}T12:00:00Z`).getUTCDay();
+  const hours = weeklyHours?.[weekday];
+  if (Array.isArray(hours)) {
+    const [startHour, startMinute] = String(hours[0]).split(':').map(Number);
+    const [endHour, endMinute] = String(hours[1]).split(':').map(Number);
+    return { start: toDateTime(day, startHour, startMinute), end: toDateTime(day, endHour, endMinute) };
+  }
   if (!openDays.has(weekday)) return null;
   return { start: toDateTime(day, openTime[0], openTime[1]), end: toDateTime(day, closeTime[0], closeTime[1]) };
 }
