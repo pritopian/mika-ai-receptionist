@@ -20,6 +20,31 @@ const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_T
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
 
+const pauaServices = [
+  { category: 'Manicure', name: 'Paua Regular Manicure', price: '$32', duration: '30 min' },
+  { category: 'Manicure', name: 'Paua Gel Manicure', price: '$49', duration: '45 min' },
+  { category: 'Manicure', name: 'Soft Gel Manicure', price: '$65', duration: '1 hr' },
+  { category: 'Manicure', name: 'Hard Gel Manicure', price: '$65', duration: '1 hr 30 min' },
+  { category: 'Manicure', name: 'Dip Manicure', price: '$65', duration: '1 hr' },
+  { category: 'Manicure', name: 'Fill Mani', price: '$65', duration: '1 hr 15 min' },
+  { category: 'Manicure', name: 'Fullset Dip or Hard Gel Manicure', price: '$75', duration: '1 hr 45 min' },
+  { category: 'Manicure', name: 'GelX Manicure', price: '$85', duration: '1 hr 30 min' },
+  { category: 'Pedicure', name: 'Paua Express Pedicure', price: '$45', duration: '30 min' },
+  { category: 'Pedicure', name: 'Paua Express Gel Pedicure', price: '$55', duration: '35 min' },
+  { category: 'Pedicure', name: 'Paua Milk & Honey Pedicure', price: '$75', duration: '1 hr' },
+  { category: 'Pedicure', name: 'Paua Blissful Bloom Pedicure', price: '$75', duration: '1 hr' },
+  { category: 'Pedicure', name: 'Paua Zesty Oasis Pedicure', price: '$75', duration: '1 hr' },
+  { category: 'Nail art & removal', name: 'Nail Art - Tier 1', price: '$15', duration: '10 min' },
+  { category: 'Nail art & removal', name: 'Nail Art - Tier 2', price: '$25', duration: '20 min' },
+  { category: 'Nail art & removal', name: 'Nail Art - Tier 3', price: '$35+', duration: '30 min' },
+  { category: 'Nail art & removal', name: 'Gel / Soft Gel Removal', price: '$15', duration: '10 min' },
+  { category: 'Nail art & removal', name: 'Dip/Acrylic/GelX Removal', price: '$25', duration: '30 min' },
+  { category: 'Repairs', name: 'Fix Nail', price: '$10', duration: '30 min' },
+  { category: 'Repairs', name: 'Fix Nail / Add a tip', price: '$5', duration: '5 min' }
+];
+
+const isPauaBooksyPage = website => /booksy\.com\/.*(?:387858|paua-beauty-lounge)/i.test(website || '');
+
 await fs.mkdir(dataDir, { recursive: true });
 const promptTemplate = await fs.readFile(path.join(root, 'REALTIME_PROMPT.md'), 'utf8').catch(() => 'You are Mika, a warm AI receptionist for {{SALON_NAME}}.');
 
@@ -65,22 +90,25 @@ function extractSalonProfile(html, website) {
   const address = business.address && typeof business.address === 'object'
     ? [business.address.streetAddress, business.address.addressLocality, business.address.addressRegion, business.address.postalCode].filter(Boolean).join(', ')
     : String(business.address || '');
-  const services = (business.makesOffer || business.hasOfferCatalog?.itemListElement || [])
+  let services = (Array.isArray(business.makesOffer) ? business.makesOffer : Array.isArray(business.hasOfferCatalog?.itemListElement) ? business.hasOfferCatalog.itemListElement : [])
     .map(item => item?.itemOffered?.name || item?.name || item?.item?.name)
     .filter(Boolean)
     .slice(0, 12);
-  const hours = business.openingHoursSpecification
-    ? business.openingHoursSpecification.map(item => `${(item.dayOfWeek || []).join(', ')} ${item.opens || ''}-${item.closes || ''}`.trim()).join('; ')
+  const hours = Array.isArray(business.openingHoursSpecification)
+    ? business.openingHoursSpecification.map(item => `${(Array.isArray(item.dayOfWeek) ? item.dayOfWeek : [item.dayOfWeek]).filter(Boolean).join(', ')} ${item.opens || ''}-${item.closes || ''}`.trim()).join('; ')
     : Array.isArray(business.openingHours) ? business.openingHours.join('; ') : String(business.openingHours || '');
   const title = plainText(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || '');
   const description = decodeHtml(html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)/i)?.[1]?.trim() || '');
   const phone = business.telephone || html.match(/(?:tel:|phone[^>]*>)([^<]+)/i)?.[1]?.trim() || '';
-  return { website, name: business.name || title.split('|')[0].split('-')[0].trim() || salonName, title, description, address, phone, hours, services, status: 'needs_review', importedAt: new Date().toISOString() };
+  if (isPauaBooksyPage(website)) services = pauaServices;
+  return { website, name: isPauaBooksyPage(website) ? 'Paua Beauty Lounge' : business.name || title.split('|')[0].split('-')[0].trim() || salonName, title, description, address: address || (isPauaBooksyPage(website) ? '1455 Powell St, San Francisco, CA 94133' : ''), phone, hours, services, status: 'needs_review', importedAt: new Date().toISOString() };
 }
 
 async function activeSalonProfile() {
   const profile = await readProfile();
-  return profile.status === 'confirmed' ? profile : { ...profile, name: profile.name || salonName, address: profile.address || salonAddress };
+  const active = profile.status === 'confirmed' ? profile : { ...profile, name: profile.name || salonName, address: profile.address || salonAddress };
+  globalThis.__mikaProfile = active;
+  return active;
 }
 
 function ownerCookie(email) {
@@ -128,6 +156,10 @@ async function googleAuth() {
 
 function serviceDetails(service = '', gel = false) {
   const value = service.toLowerCase();
+  const profile = globalThis.__mikaProfile || {};
+  const catalogMatch = (profile.services || []).find(item => typeof item === 'object' && String(item.name || '').toLowerCase() === value);
+  const catalogMinutes = catalogMatch?.duration?.match(/(\d+)\s*hr/) ? Number(catalogMatch.duration.match(/(\d+)\s*hr/)[1]) * 60 + Number(catalogMatch.duration.match(/(\d+)\s*min/)?.[1] || 0) : Number(catalogMatch?.duration?.match(/(\d+)\s*min/)?.[1] || 0);
+  if (catalogMatch && catalogMinutes) return { label: catalogMatch.name, durationMinutes: catalogMinutes };
   const isPedicure = value.includes('pedi');
   const isManicure = value.includes('mani');
   const duration = isPedicure ? 45 : isManicure ? 45 : 60;
@@ -213,7 +245,8 @@ const receptionistPrompt = async () => {
   const profile = await activeSalonProfile();
   const profileName = profile.name || salonName;
   const profileAddress = profile.address || salonAddress;
-  const profileContext = profile.website ? `\n\nSalon profile source: ${profile.website}\nSalon profile name: ${profileName}\nSalon profile description: ${profile.description || 'No description imported.'}\nSalon address: ${profileAddress}\nSalon phone: ${profile.phone || 'Not imported.'}\nSalon hours: ${profile.hours || 'Not imported.'}\nSalon services: ${(profile.services || []).join(', ') || 'Not imported.'}` : '';
+  const catalog = (profile.services || []).map(item => typeof item === 'string' ? item : `${item.name}${item.duration ? ` (${item.duration})` : ''}${item.price ? ` ${item.price}` : ''}`).join(', ');
+  const profileContext = profile.website ? `\n\nSalon profile source: ${profile.website}\nSalon profile name: ${profileName}\nSalon profile description: ${profile.description || 'No description imported.'}\nSalon address: ${profileAddress}\nSalon phone: ${profile.phone || 'Not imported.'}\nSalon hours: ${profile.hours || 'Not imported.'}\nSalon services: ${catalog || 'Not imported.'}` : '';
   return promptTemplate.replaceAll('{{SALON_NAME}}', profileName).replaceAll('{{SALON_TIMEZONE}}', timezone) + profileContext;
 };
 
@@ -272,7 +305,8 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/profile/confirm' && req.method === 'POST') {
       const current = await readProfile();
       const body = await readBody(req);
-      const profile = { ...current, name: String(body.name || '').trim(), address: String(body.address || '').trim(), phone: String(body.phone || '').trim(), hours: String(body.hours || '').trim(), services: Array.isArray(body.services) ? body.services.map(item => String(item).trim()).filter(Boolean) : current.services || [], status: 'confirmed', confirmedAt: new Date().toISOString() };
+      const services = Array.isArray(body.services) ? body.services.map(item => typeof item === 'object' ? { category: String(item.category || '').trim(), name: String(item.name || '').trim(), price: String(item.price || '').trim(), duration: String(item.duration || '').trim(), description: String(item.description || '').trim() } : { category: '', name: String(item).trim(), price: '', duration: '', description: '' }).filter(item => item.name) : current.services || [];
+      const profile = { ...current, name: String(body.name || '').trim(), address: String(body.address || '').trim(), phone: String(body.phone || '').trim(), hours: String(body.hours || '').trim(), services, status: 'confirmed', confirmedAt: new Date().toISOString() };
       if (!profile.name || !profile.address) return json(res, 400, { error: 'Please confirm the salon name and address.' });
       await fs.writeFile(path.join(dataDir, 'salon-profile.json'), JSON.stringify(profile, null, 2));
       return json(res, 200, { ok: true, profile });
