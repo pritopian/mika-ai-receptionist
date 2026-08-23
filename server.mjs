@@ -133,7 +133,7 @@ function extractSalonProfile(html, website) {
 async function activeSalonProfile() {
   const profile = await readProfile();
   if (/paua/i.test(salonName)) {
-    const activePaua = { ...defaultPauaProfile, ...profile, services: profile.services?.length ? profile.services : pauaServices, address: profile.address || defaultPauaProfile.address, phone: profile.phone || defaultPauaProfile.phone };
+    const activePaua = { ...defaultPauaProfile, ...profile, services: profile.services?.length ? profile.services : pauaServices, address: profile.address || defaultPauaProfile.address, phone: profile.phone || defaultPauaProfile.phone, hours: profile.hours || defaultPauaProfile.hours };
     globalThis.__mikaProfile = activePaua;
     return activePaua;
   }
