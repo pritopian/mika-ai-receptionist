@@ -238,9 +238,16 @@ async function logBooking(booking) {
     start: { dateTime: booking.start, timeZone: timezone },
     end: { dateTime: booking.end, timeZone: timezone }
   } });
-  const sheetId = await ensureBookingSheet(sheets);
-  await sheets.spreadsheets.values.append({ spreadsheetId: sheetId, range: 'Bookings!A:G', valueInputOption: 'USER_ENTERED', requestBody: { values: [[new Date().toISOString(), booking.customerName, booking.phone, booking.service, booking.technician || 'available team member', booking.start, event.data.id]] } });
-  return { ...booking, eventId: event.data.id, sheetId, sheetUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/edit` };
+  let sheetId;
+  let sheetError = '';
+  try {
+    sheetId = await ensureBookingSheet(sheets);
+    await sheets.spreadsheets.values.append({ spreadsheetId: sheetId, range: 'Bookings!A:G', valueInputOption: 'USER_ENTERED', requestBody: { values: [[new Date().toISOString(), booking.customerName, booking.phone, booking.service, booking.technician || 'available team member', booking.start, event.data.id]] } });
+  } catch (error) {
+    sheetError = error.message;
+    console.error(`Booking log: ${sheetError}`);
+  }
+  return { ...booking, eventId: event.data.id, sheetId, sheetError, sheetUrl: sheetId ? `https://docs.google.com/spreadsheets/d/${sheetId}/edit` : '' };
 }
 
 async function ensureBookingSheet(sheets) {
@@ -297,12 +304,12 @@ async function handleTool(name, args) {
     const customerText = await sendText(args.phone, confirmation);
     const customerEmail = await sendEmail(args.email, `Your ${salonName} appointment`, confirmation);
     const ownerText = await sendText(process.env.SALON_OWNER_PHONE, `Mika booked ${args.customerName} for ${args.service} on ${new Date(args.start).toLocaleString('en-US', { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' })}. Technician: ${args.technician || 'available team member'}.`);
-    await appendLog({ type: 'booking', customer: args.customerName, service: args.service, start: args.start, technician: args.technician || 'available team member', calendarEventId: booking.eventId, notifications: { customerText, customerEmail, ownerText } });
+    await appendLog({ type: 'booking', customer: args.customerName, service: args.service, start: args.start, technician: args.technician || 'available team member', calendarEventId: booking.eventId, sheetStatus: booking.sheetError ? 'failed' : 'saved', sheetError: booking.sheetError || '', notifications: { customerText, customerEmail, ownerText } });
     await logActivityToSheet({ type: 'booking', customer: args.customerName, service: args.service, status: 'booked', channel: 'calendar', details: booking.eventId });
     await logActivityToSheet({ type: 'customer confirmation', customer: args.customerName, service: args.service, status: customerText.sent ? 'sent' : 'blocked', channel: 'sms', details: customerText.errorCode || '' });
     await logActivityToSheet({ type: 'customer confirmation', customer: args.customerName, service: args.service, status: customerEmail.sent ? 'sent' : 'not configured', channel: 'email', details: customerEmail.error || '' });
     await logActivityToSheet({ type: 'owner notification', customer: args.customerName, service: args.service, status: ownerText.sent ? 'sent' : 'blocked', channel: 'sms', details: ownerText.errorCode || '' });
-    return { ...booking, confirmationSent: customerText.sent || customerEmail.sent, sheetUrl: booking.sheetUrl };
+    return { ...booking, calendarBooked: true, confirmationSent: customerText.sent || customerEmail.sent, sheetUrl: booking.sheetUrl };
   }
   return { error: 'Unknown tool.' };
 }
