@@ -311,6 +311,7 @@ async function readSheetInfo() {
 
 async function completeBooking(booking, checkedSlots = []) {
   const { calendar: cal, sheets } = await calendar();
+  if (!String(booking.customerName || '').trim() || /^(customer|unknown|caller|guest|the customer)$/i.test(String(booking.customerName).trim())) throw new Error('I need the customer name before I can complete the booking.');
   const chosenStart = new Date(booking.start).getTime();
   const chosenEnd = new Date(booking.end).getTime();
   const wasReturned = checkedSlots.some(slot => new Date(slot.start).getTime() === chosenStart && new Date(slot.end).getTime() === chosenEnd);
@@ -547,7 +548,19 @@ wss.on('connection', (twilioWs) => {
       if (event.type === 'response.output_audio.delta' && streamSid) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: event.delta } }));
       if (event.type === 'input_audio_buffer.speech_stopped') openaiWs.send(JSON.stringify({ type: 'response.create' }));
       if (event.type === 'response.function_call_arguments.done') {
-        try { const args = JSON.parse(event.arguments); const output = await handleTool(event.name, { ...args, phone: args.phone || callerPhone }, callContext); openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: event.call_id, output: JSON.stringify(output) } })); openaiWs.send(JSON.stringify({ type: 'response.create' })); }
+        try {
+          const args = JSON.parse(event.arguments);
+          const output = await handleTool(event.name, { ...args, phone: args.phone || callerPhone }, callContext);
+          openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: event.call_id, output: JSON.stringify(output) } }));
+          const strictInstructions = event.name === 'check_availability'
+            ? output.slots?.length
+              ? `The availability check is authoritative. You may offer only these exact returned openings: ${output.slots.map(slot => `${slot.start} to ${slot.end}`).join('; ')}. Do not say any other time, including a rounded or invented time.`
+              : 'The availability check returned no openings. Say that no opening was found for that day and ask whether the caller wants another day. Do not suggest any time.'
+            : event.name === 'complete_booking'
+              ? output.confirmationSent ? 'The booking succeeded and the confirmation was sent. Say the short confirmation from your instructions.' : 'The booking succeeded but the confirmation message did not send. Be honest about that.'
+              : '';
+          openaiWs.send(JSON.stringify({ type: 'response.create', response: strictInstructions ? { instructions: strictInstructions } : undefined }));
+        }
         catch (error) { await appendLog({ type: 'tool_error', callSid: callContext.callSid, phone: callerPhone, details: JSON.stringify({ tool: event.name, arguments: event.arguments, error: error.message }) }); openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: event.call_id, output: JSON.stringify({ error: error.message }) } })); openaiWs.send(JSON.stringify({ type: 'response.create' })); }
       }
     });
