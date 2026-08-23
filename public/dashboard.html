@@ -57,7 +57,7 @@ async function loadStatus() {
 }
 async function loadLogs() {
   const items = await fetch('/api/logs').then(response => response.json());
-  if (items.length) document.querySelector('#logs').innerHTML = items.slice(0,8).map(item => `<article class="log"><div><strong>${esc(item.type.replaceAll('_',' '))}</strong><span>${localDate(item.at)}</span></div><p>${esc(item.customer || 'Mika activity')}${item.phone ? ` · ${esc(item.phone)}` : ''}${item.service ? ` · ${esc(item.service)}` : ''}${item.start ? ` · ${localDate(item.start)}` : ''}${item.technician ? ` · ${esc(item.technician)}` : ''}${item.notes ? ` · ${esc(item.notes)}` : ''}</p></article>`).join('');
+  if (items.length) document.querySelector('#logs').innerHTML = items.slice(0,12).map(item => `<article class="log"><div><strong>${esc(item.type.replaceAll('_',' '))}</strong><span>${localDate(item.at)}</span></div><p>${esc(item.customer || 'Mika activity')}${item.phone ? ` · ${esc(item.phone)}` : ''}${item.service ? ` · ${esc(item.service)}` : ''}${item.start ? ` · ${localDate(item.start)}` : ''}${item.technician ? ` · ${esc(item.technician)}` : ''}${item.notes ? ` · ${esc(item.notes)}` : ''}</p>${item.details ? `<details><summary>Tool details</summary><pre>${esc(item.details)}</pre></details>` : ''}</article>`).join('');
 }
 async function loadCalendar() {
   const date = document.querySelector('#calendarDate').value;

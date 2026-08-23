@@ -181,6 +181,8 @@ async function googleAuth() {
 function serviceDetails(service = '', gel = false) {
   const value = service.toLowerCase();
   const profile = globalThis.__mikaProfile || {};
+  const combined = ['pedicure', 'manicure'].filter(kind => value.includes(kind));
+  if (combined.length === 2) return { label: 'pedicure and manicure', durationMinutes: 90 };
   const catalogMatch = (profile.services || []).find(item => typeof item === 'object' && String(item.name || '').toLowerCase() === value);
   const catalogMinutes = catalogMatch?.duration?.match(/(\d+)\s*hr/) ? Number(catalogMatch.duration.match(/(\d+)\s*hr/)[1]) * 60 + Number(catalogMatch.duration.match(/(\d+)\s*min/)?.[1] || 0) : Number(catalogMatch?.duration?.match(/(\d+)\s*min/)?.[1] || 0);
   if (catalogMatch && catalogMinutes) return { label: catalogMatch.name, durationMinutes: catalogMinutes };
@@ -242,13 +244,15 @@ async function checkAvailability({ date, service, requestedTime = '', technician
     if (!overlaps) candidateSlots.push({ start: slotStart.toISOString(), end: slotEnd.toISOString(), technician: technician || 'available team member' });
   }
   const requestedMinutes = /^\d{1,2}:\d{2}$/.test(requestedTime) ? requestedTime.split(':').map(Number).reduce((hour, minute) => hour * 60 + minute) : null;
-  if (requestedMinutes !== null) candidateSlots.sort((a, b) => Math.abs(new Date(a.start).getHours() * 60 + new Date(a.start).getMinutes() - requestedMinutes) - Math.abs(new Date(b.start).getHours() * 60 + new Date(b.start).getMinutes() - requestedMinutes));
+  const hourSlots = candidateSlots.filter(slot => localDateParts(new Date(slot.start)).minute === '00');
+  const offerableSlots = hourSlots.length ? hourSlots : candidateSlots;
+  if (requestedMinutes !== null) offerableSlots.sort((a, b) => Math.abs(Number(localDateParts(new Date(a.start)).hour) * 60 + Number(localDateParts(new Date(a.start)).minute) - requestedMinutes) - Math.abs(Number(localDateParts(new Date(b.start)).hour) * 60 + Number(localDateParts(new Date(b.start)).minute) - requestedMinutes));
   const positions = requestedMinutes !== null
-    ? candidateSlots.slice(0, 3).map((_, index) => index)
-    : candidateSlots.length <= 3
-    ? candidateSlots.map((_, index) => index)
-    : [...new Set([0, Math.round((candidateSlots.length - 1) / 2), candidateSlots.length - 1])];
-  return { date: day, service: detail.label, durationMinutes: detail.durationMinutes, slots: positions.map(index => candidateSlots[index]) };
+    ? offerableSlots.slice(0, 3).map((_, index) => index)
+    : offerableSlots.length <= 3
+    ? offerableSlots.map((_, index) => index)
+    : [...new Set([0, Math.round((offerableSlots.length - 1) / 2), offerableSlots.length - 1])];
+  return { date: day, service: detail.label, durationMinutes: detail.durationMinutes, slots: positions.map(index => offerableSlots[index]) };
 }
 
 async function slotIsAvailable(startValue, endValue) {
@@ -283,8 +287,12 @@ async function readSheetInfo() {
   } catch { return null; }
 }
 
-async function completeBooking(booking) {
+async function completeBooking(booking, checkedSlots = []) {
   const { calendar: cal, sheets } = await calendar();
+  const chosenStart = new Date(booking.start).getTime();
+  const chosenEnd = new Date(booking.end).getTime();
+  const wasReturned = checkedSlots.some(slot => new Date(slot.start).getTime() === chosenStart && new Date(slot.end).getTime() === chosenEnd);
+  if (!wasReturned) throw new Error('I can only book an opening I just checked. Let me check the calendar again.');
   if (!(await slotIsAvailable(booking.start, booking.end))) throw new Error('That opening was just taken. I will check the next closest time.');
   const calendarId = process.env.GOOGLE_CALENDAR_ID || 'primary';
   const event = await cal.events.insert({ calendarId, requestBody: {
@@ -347,13 +355,23 @@ const receptionistPrompt = async () => {
 function toolDefinitions() {
   return [
     { type: 'function', name: 'check_availability', description: 'The only way to know appointment availability. Check the connected salon Google Calendar using salon hours, service duration, and a 15-minute buffer. Never invent a slot.', parameters: { type: 'object', properties: { date: { type: 'string', description: 'Requested date in YYYY-MM-DD.' }, service: { type: 'string' }, requestedTime: { type: 'string', description: 'Optional requested local time in HH:MM.' }, technician: { type: 'string' } }, required: ['date', 'service'] } },
-    { type: 'function', name: 'complete_booking', description: 'After the caller chooses a returned slot, recheck it and create the Calendar event, write the Google Sheet row, and send the Twilio SMS confirmation. The caller phone comes from Twilio automatically.', parameters: { type: 'object', properties: { customerName: { type: 'string' }, phone: { type: 'string' }, service: { type: 'string' }, technician: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' }, notes: { type: 'string' } }, required: ['customerName', 'service', 'start', 'end'] } }
+    { type: 'function', name: 'complete_booking', description: 'Only call after the customer chooses one exact slot returned by the latest check_availability result. The server rejects any other time. Recheck it, create the Calendar event, write the Google Sheet row, and send the Twilio SMS confirmation. The caller phone comes from Twilio automatically.', parameters: { type: 'object', properties: { customerName: { type: 'string' }, phone: { type: 'string' }, service: { type: 'string' }, technician: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' }, notes: { type: 'string' } }, required: ['customerName', 'service', 'start', 'end'] } }
   ];
 }
 
-async function handleTool(name, args) {
-  if (name === 'check_availability') return checkAvailability(args);
-  if (name === 'complete_booking') { const booking = await completeBooking(args); await appendLog({ type: 'booking', customer: args.customerName, phone: args.phone, service: args.service, start: args.start, technician: args.technician || 'available team member', notes: args.notes || '', calendarEventId: booking.eventId, sheetStatus: booking.sheetStatus, sheetError: booking.sheetError, smsStatus: booking.smsStatus, smsError: booking.smsError }); return booking; }
+async function handleTool(name, args, context = {}) {
+  if (name === 'check_availability') {
+    const output = await checkAvailability(args);
+    context.lastAvailabilitySlots = output.slots || [];
+    await appendLog({ type: 'tool_check_availability', callSid: context.callSid, phone: context.phone, details: JSON.stringify({ args, output }) });
+    return output;
+  }
+  if (name === 'complete_booking') {
+    const booking = await completeBooking(args, context.lastAvailabilitySlots || []);
+    context.lastAvailabilitySlots = [];
+    await appendLog({ type: 'booking', callSid: context.callSid, customer: args.customerName, phone: args.phone, service: args.service, start: args.start, technician: args.technician || 'available team member', notes: args.notes || '', calendarEventId: booking.eventId, sheetStatus: booking.sheetStatus, sheetError: booking.sheetError, smsStatus: booking.smsStatus, smsError: booking.smsError });
+    return booking;
+  }
   return { error: 'Unknown tool.' };
 }
 
@@ -469,23 +487,24 @@ wss.on('connection', (twilioWs) => {
   let streamSid;
   let openaiWs;
   let callerPhone = '';
+  const callContext = { callSid: null, phone: '', lastAvailabilitySlots: [] };
   const connectOpenAI = () => {
     openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-mini'}`, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } });
     openaiWs.on('open', async () => {
       openaiWs.send(JSON.stringify({ type: 'session.update', session: { type: 'realtime', instructions: await receptionistPrompt(), output_modalities: ['audio'], audio: { input: { format: { type: 'audio/pcmu' }, turn_detection: { type: 'server_vad', threshold: 0.7, prefix_padding_ms: 400, silence_duration_ms: 1200, create_response: false, interrupt_response: true } }, output: { format: { type: 'audio/pcmu' }, voice: 'marin' } }, tools: toolDefinitions(), tool_choice: 'auto' } }));
-      openaiWs.send(JSON.stringify({ type: 'response.create', response: { instructions: `Say exactly: Hi, ${salonName}, how can I help you?` } }));
+      openaiWs.send(JSON.stringify({ type: 'response.create', response: { instructions: `Say exactly: Hi, this is ${salonName}. How can I help you?` } }));
     });
     openaiWs.on('message', async (raw) => {
       const event = JSON.parse(raw.toString());
       if (event.type === 'response.output_audio.delta' && streamSid) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: event.delta } }));
       if (event.type === 'input_audio_buffer.speech_stopped') openaiWs.send(JSON.stringify({ type: 'response.create' }));
       if (event.type === 'response.function_call_arguments.done') {
-        try { const args = JSON.parse(event.arguments); const output = await handleTool(event.name, { ...args, phone: args.phone || callerPhone }); openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: event.call_id, output: JSON.stringify(output) } })); openaiWs.send(JSON.stringify({ type: 'response.create' })); }
-        catch (error) { openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: event.call_id, output: JSON.stringify({ error: error.message }) } })); openaiWs.send(JSON.stringify({ type: 'response.create' })); }
+        try { const args = JSON.parse(event.arguments); const output = await handleTool(event.name, { ...args, phone: args.phone || callerPhone }, callContext); openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: event.call_id, output: JSON.stringify(output) } })); openaiWs.send(JSON.stringify({ type: 'response.create' })); }
+        catch (error) { await appendLog({ type: 'tool_error', callSid: callContext.callSid, phone: callerPhone, details: JSON.stringify({ tool: event.name, arguments: event.arguments, error: error.message }) }); openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: event.call_id, output: JSON.stringify({ error: error.message }) } })); openaiWs.send(JSON.stringify({ type: 'response.create' })); }
       }
     });
   };
-  twilioWs.on('message', (raw) => { const event = JSON.parse(raw.toString()); if (event.event === 'start') { streamSid = event.start.streamSid; callerPhone = event.start.customParameters?.callerPhone || ''; appendLog({ type: 'call_started', callSid: event.start.callSid || null, phone: callerPhone }); connectOpenAI(); } if (event.event === 'media' && openaiWs?.readyState === WebSocket.OPEN) openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: event.media.payload })); });
+  twilioWs.on('message', (raw) => { const event = JSON.parse(raw.toString()); if (event.event === 'start') { streamSid = event.start.streamSid; callerPhone = event.start.customParameters?.callerPhone || ''; callContext.callSid = event.start.callSid || null; callContext.phone = callerPhone; appendLog({ type: 'call_started', callSid: callContext.callSid, phone: callerPhone }); connectOpenAI(); } if (event.event === 'media' && openaiWs?.readyState === WebSocket.OPEN) openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: event.media.payload })); });
   twilioWs.on('close', () => openaiWs?.close());
 });
 
