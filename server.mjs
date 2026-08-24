@@ -314,6 +314,9 @@ async function completeBooking(booking, checkedSlots = []) {
   if (!String(booking.customerName || '').trim() || /^(customer|unknown|caller|guest|the customer)$/i.test(String(booking.customerName).trim())) throw new Error('I need the customer name before I can complete the booking.');
   const chosenStart = new Date(booking.start).getTime();
   const chosenEnd = new Date(booking.end).getTime();
+  const bookingDay = new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date(booking.start));
+  const window = businessWindow(bookingDay);
+  if (!window || chosenStart < window.start.getTime() || chosenEnd > window.end.getTime()) throw new Error('That time is outside the salon hours. I will check another opening.');
   const wasReturned = checkedSlots.some(slot => new Date(slot.start).getTime() === chosenStart && new Date(slot.end).getTime() === chosenEnd);
   if (!wasReturned) throw new Error('I can only book an opening I just checked. Let me check the calendar again.');
   if (!(await slotIsAvailable(booking.start, booking.end))) throw new Error('That opening was just taken. I will check the next closest time.');
