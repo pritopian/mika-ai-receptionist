@@ -52,8 +52,6 @@ const pauaServices = [
 
 const defaultPauaProfile = { website: 'https://pauabeautylounge.booksy.com/', name: 'Paua Beauty Lounge', title: 'Paua Beauty Lounge', description: 'Nail salon appointments handled by Mika.', address: '1455 Powell St, San Francisco, CA 94133', phone: '(415) 525-4766', hours: 'Sunday 10 AM-5:30 PM; Monday 11 AM-7:30 PM; Tuesday 1-7:30 PM; Wednesday 12-7:30 PM; Thursday 12-7:30 PM; Friday 11 AM-7:30 PM; Saturday 10 AM-5:30 PM', services: pauaServices, status: 'confirmed' };
 
-const isPauaBooksyPage = website => /(?:pauabeautylounge|paua-beauty-lounge|387858)/i.test(website || '');
-
 function requestPublicBaseUrl(req) {
   const forwardedHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
   const forwardedProto = String(req.headers['x-forwarded-proto'] || (forwardedHost.includes('localhost') ? 'http' : 'https')).split(',')[0].trim();
@@ -90,46 +88,6 @@ async function readProfile() {
   try { return JSON.parse(await fs.readFile(path.join(dataDir, 'salon-profile.json'), 'utf8')); } catch { return {}; }
 }
 
-function decodeHtml(value = '') {
-  return value.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
-}
-
-function plainText(value = '') {
-  return decodeHtml(value.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim());
-}
-
-function structuredBusinessData(html) {
-  const blocks = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
-  for (const block of blocks) {
-    try {
-      const parsed = JSON.parse(block[1].trim());
-      const candidates = Array.isArray(parsed) ? parsed : [parsed, ...(parsed?.['@graph'] || [])];
-      const business = candidates.find(item => /LocalBusiness|BeautySalon|HairSalon|NailSalon|DaySpa|HealthAndBeautyBusiness/i.test(String(item?.['@type'] || '')));
-      if (business) return business;
-    } catch {}
-  }
-  return {};
-}
-
-function extractSalonProfile(html, website) {
-  const business = structuredBusinessData(html);
-  const address = business.address && typeof business.address === 'object'
-    ? [business.address.streetAddress, business.address.addressLocality, business.address.addressRegion, business.address.postalCode].filter(Boolean).join(', ')
-    : String(business.address || '');
-  let services = (Array.isArray(business.makesOffer) ? business.makesOffer : Array.isArray(business.hasOfferCatalog?.itemListElement) ? business.hasOfferCatalog.itemListElement : [])
-    .map(item => item?.itemOffered?.name || item?.name || item?.item?.name)
-    .filter(Boolean)
-    .slice(0, 12);
-  const hours = Array.isArray(business.openingHoursSpecification)
-    ? business.openingHoursSpecification.map(item => `${(Array.isArray(item.dayOfWeek) ? item.dayOfWeek : [item.dayOfWeek]).filter(Boolean).join(', ')} ${item.opens || ''}-${item.closes || ''}`.trim()).join('; ')
-    : Array.isArray(business.openingHours) ? business.openingHours.join('; ') : String(business.openingHours || '');
-  const title = plainText(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || '');
-  const description = decodeHtml(html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)/i)?.[1]?.trim() || '');
-  const phone = business.telephone || html.match(/(?:tel:|phone[^>]*>)([^<]+)/i)?.[1]?.trim() || '';
-  if (isPauaBooksyPage(website)) services = pauaServices;
-  return { website, name: isPauaBooksyPage(website) ? 'Paua Beauty Lounge' : business.name || title.split('|')[0].split('-')[0].trim() || salonName, title, description, address: address || (isPauaBooksyPage(website) ? '1455 Powell St, San Francisco, CA 94133' : ''), phone: phone || (isPauaBooksyPage(website) ? '(415) 525-4766' : ''), hours, services, status: 'needs_review', importedAt: new Date().toISOString() };
-}
-
 async function activeSalonProfile() {
   const profile = await readProfile();
   if (/paua/i.test(salonName)) {
@@ -140,10 +98,6 @@ async function activeSalonProfile() {
   const active = profile.status === 'confirmed' ? profile : { ...profile, name: profile.name || salonName, address: profile.address || salonAddress };
   globalThis.__mikaProfile = active;
   return active;
-}
-
-function ownerCookie(email) {
-  return Buffer.from(JSON.stringify({ email, at: Date.now() })).toString('base64url');
 }
 
 async function logActivityToSheet(entry) {
@@ -391,13 +345,6 @@ async function sendText(to, body) {
   }
 }
 
-async function sendEmail(to, subject, body) {
-  if (!process.env.RESEND_API_KEY || !process.env.SALON_FROM_EMAIL || !to) return { sent: false, skipped: true };
-  const response = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ from: process.env.SALON_FROM_EMAIL, to: [to], subject, text: body }) });
-  if (!response.ok) return { sent: false, error: await response.text() };
-  return { sent: true, provider: 'resend' };
-}
-
 const receptionistPrompt = async () => {
   const profile = await activeSalonProfile();
   const profileName = profile.name || salonName;
@@ -452,52 +399,8 @@ const server = http.createServer(async (req, res) => {
       if (!info) return json(res, 404, { error: 'The booking Sheet is not available yet.' });
       const { sheets } = await calendar();
       await syncCalendarBookingsToSheet(sheets, info.spreadsheetId);
-      const response = await sheets.spreadsheets.values.get({ spreadsheetId: info.spreadsheetId, range: 'Bookings!A:G' });
+      const response = await sheets.spreadsheets.values.get({ spreadsheetId: info.spreadsheetId, range: 'Bookings!A:H' });
       return json(res, 200, { ...info, rows: response.data.values || [] });
-    }
-    if (url.pathname === '/api/login' && req.method === 'POST') {
-      const { email } = await readBody(req);
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || ''))) return json(res, 400, { error: 'Enter a valid email address.' });
-      await fs.writeFile(path.join(dataDir, 'owner.json'), JSON.stringify({ email, signedInAt: new Date().toISOString() }, null, 2));
-      res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': `mika_owner=${ownerCookie(email)}; Path=/; SameSite=Lax` }); return res.end(JSON.stringify({ ok: true, email }));
-    }
-    if (url.pathname === '/api/profile/import' && req.method === 'POST') {
-      const { website } = await readBody(req);
-      if (!/^https?:\/\//i.test(String(website || ''))) return json(res, 400, { error: 'Paste a full website URL.' });
-      let title = '';
-      let description = '';
-      let html = '';
-      try {
-        const response = await fetch(website, { headers: { 'user-agent': 'Mika salon profile importer' } });
-        html = await response.text();
-        title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/\s+/g, ' ').trim() || '';
-        description = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)/i)?.[1]?.trim() || '';
-      } catch (error) { return json(res, 400, { error: `Could not read that website: ${error.message}` }); }
-      const profile = extractSalonProfile(html, website);
-      await fs.writeFile(path.join(dataDir, 'salon-profile.json'), JSON.stringify(profile, null, 2));
-      return json(res, 200, { ok: true, profile });
-    }
-    if (url.pathname === '/api/profile/confirm' && req.method === 'POST') {
-      const current = await readProfile();
-      const body = await readBody(req);
-      const services = Array.isArray(body.services) ? body.services.map(item => typeof item === 'object' ? { category: String(item.category || '').trim(), name: String(item.name || '').trim(), price: String(item.price || '').trim(), duration: String(item.duration || '').trim(), description: String(item.description || '').trim() } : { category: '', name: String(item).trim(), price: '', duration: '', description: '' }).filter(item => item.name) : current.services || [];
-      const profile = { ...current, name: String(body.name || '').trim(), address: String(body.address || '').trim(), phone: String(body.phone || '').trim(), hours: String(body.hours || '').trim(), services, status: 'confirmed', confirmedAt: new Date().toISOString() };
-      if (!profile.name || !profile.address) return json(res, 400, { error: 'Please confirm the salon name and address.' });
-      await fs.writeFile(path.join(dataDir, 'salon-profile.json'), JSON.stringify(profile, null, 2));
-      return json(res, 200, { ok: true, profile });
-    }
-    if (url.pathname === '/twilio/sms' && req.method === 'POST') {
-      const body = await readBody(req).catch(() => ({}));
-      const site = String(body.Body || '').trim();
-      if (/^https?:\/\//i.test(site)) {
-        await fs.writeFile(path.join(dataDir, 'salon-profile.json'), JSON.stringify({ ownerPhone: body.From || '', website: site, receivedAt: new Date().toISOString() }, null, 2));
-        const setupUrl = req.headers.host?.includes('localhost') ? `http://${req.headers.host}` : `https://${req.headers.host}`;
-        await sendText(body.From, `Thank you, I’m looking through ${site} now. Connect Google here: ${setupUrl}/api/google/connect. That gives me one permission for Calendar and Sheets.`);
-      } else if (body.From) {
-        await sendText(body.From, `I’m Mika, your AI receptionist setup assistant. Send me your salon website first, and I’ll learn your services before we connect your calendar.`);
-      }
-      const twiml = new twilio.twiml.MessagingResponse();
-      res.writeHead(200, { 'content-type': 'text/xml' }); return res.end(twiml.toString());
     }
     if (url.pathname === '/api/google/connect') {
       const auth = oauthClient(requestRedirectUri(req));
