@@ -561,10 +561,21 @@ wss.on('connection', (twilioWs) => {
           openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: event.call_id, output: JSON.stringify(output) } }));
           const strictInstructions = event.name === 'check_availability'
             ? output.slots?.length
-              ? `The availability check is authoritative. You may offer only these exact returned openings in salon local time: ${output.slots.map(slot => slot.label).join(', ')}. ${args.requestedTime ? `The caller asked for around ${args.requestedTime}. If that time is not in the returned openings, say “I don’t have an opening around that time” rather than saying the exact time is booked. ` : ''}Say: “Here’s what I’m seeing: ${output.slots.map(slot => slot.label).join(', ')}. Which works best?” Do not say any other time or claim a calendar event that the tool did not return.`
+              ? (() => {
+                const requestedMatch = String(args.requestedTime || '').match(/^(\d{1,2}):\d{2}$/);
+                const requestedHour = requestedMatch ? Number(requestedMatch[1]) : null;
+                if (requestedHour === null) return `The caller did not give a specific time. Offer no more than two or three of these exact returned openings in salon local time: ${output.slots.slice(0, 3).map(slot => slot.label).join(', ')}. Say: “Here’s what I’m seeing: ${output.slots.slice(0, 3).map(slot => slot.label).join(', ')}. Which works best?” Do not say any other time.`;
+                const exactSlot = requestedHour === null ? null : output.slots.find(slot => {
+                  const hour = Number(localDateParts(new Date(slot.start)).hour);
+                  return hour === requestedHour || hour === (requestedHour + 12) % 24;
+                });
+                if (exactSlot) return `The caller already gave the time. The exact requested opening is available at ${exactSlot.label}. Do not ask what time they want again and do not list other openings. Say briefly: “I have ${exactSlot.label} available.” Then continue with only the next missing booking detail.`;
+                const alternatives = output.slots.slice(0, 2).map(slot => slot.label).join(' or ');
+                return `The caller already gave the time, but it is not among the returned openings. Say “I don’t have an opening around that time, but I do have ${alternatives}.” Do not call the requested time booked, do not ask the time again, and do not offer any other time.`;
+              })()
               : 'The availability check returned no openings. Say that no opening was found for that day and ask whether the caller wants another day. Do not suggest any time.'
             : event.name === 'complete_booking'
-              ? output.confirmationSent ? 'The booking succeeded and the confirmation was sent. Say exactly: “You’re all set. Thank you. Your nails have a date. I’ve sent your confirmation.”' : 'The booking succeeded but the confirmation message did not send. Be honest about that.'
+              ? output.confirmationSent ? `The booking succeeded and the confirmation was sent. Use the customer’s name in the goodbye. Say exactly: “You’re all set, ${output.customerName || args.customerName}. Thank you. Your nails have a date. I’ve sent your confirmation.”` : 'The booking succeeded but the confirmation message did not send. Be honest about that.'
               : '';
           openaiWs.send(JSON.stringify({ type: 'response.create', response: strictInstructions ? { instructions: strictInstructions } : undefined }));
         }
