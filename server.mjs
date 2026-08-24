@@ -561,10 +561,10 @@ wss.on('connection', (twilioWs) => {
           openaiWs.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: event.call_id, output: JSON.stringify(output) } }));
           const strictInstructions = event.name === 'check_availability'
             ? output.slots?.length
-              ? `The availability check is authoritative. You may offer only these exact returned openings in salon local time: ${output.slots.map(slot => slot.label).join(', ')}. Say: “Here’s what I’m seeing: ${output.slots.map(slot => slot.label).join(', ')}. Which works best?” Do not say any other time.`
+              ? `The availability check is authoritative. You may offer only these exact returned openings in salon local time: ${output.slots.map(slot => slot.label).join(', ')}. ${args.requestedTime ? `The caller asked for around ${args.requestedTime}. If that time is not in the returned openings, say “I don’t have an opening around that time” rather than saying the exact time is booked. ` : ''}Say: “Here’s what I’m seeing: ${output.slots.map(slot => slot.label).join(', ')}. Which works best?” Do not say any other time or claim a calendar event that the tool did not return.`
               : 'The availability check returned no openings. Say that no opening was found for that day and ask whether the caller wants another day. Do not suggest any time.'
             : event.name === 'complete_booking'
-              ? output.confirmationSent ? 'The booking succeeded and the confirmation was sent. Say the short confirmation from your instructions.' : 'The booking succeeded but the confirmation message did not send. Be honest about that.'
+              ? output.confirmationSent ? 'The booking succeeded and the confirmation was sent. Say exactly: “You’re all set. Thank you. Your nails have a date. I’ve sent your confirmation.”' : 'The booking succeeded but the confirmation message did not send. Be honest about that.'
               : '';
           openaiWs.send(JSON.stringify({ type: 'response.create', response: strictInstructions ? { instructions: strictInstructions } : undefined }));
         }
