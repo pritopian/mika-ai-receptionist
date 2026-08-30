@@ -26,6 +26,10 @@ const weeklyHours = (() => {
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
   : null;
+const squareEnvironment = process.env.SQUARE_ENVIRONMENT === 'sandbox' ? 'sandbox' : 'production';
+const squareApiBase = squareEnvironment === 'sandbox' ? 'https://connect.squareupsandbox.com/v2' : 'https://connect.squareup.com/v2';
+const squareOauthBase = squareEnvironment === 'sandbox' ? 'https://connect.squareupsandbox.com/oauth2' : 'https://connect.squareup.com/oauth2';
+const squareApiVersion = process.env.SQUARE_API_VERSION || '2026-08-19';
 
 const pauaServices = [
   { category: 'Manicure', name: 'Paua Regular Manicure', price: '$32', duration: '30 min' },
@@ -129,6 +133,8 @@ const requestRedirectUri = req => {
   return `${protocol}://${host}/api/google/callback`;
 };
 
+const squareRedirectUri = req => process.env.SQUARE_REDIRECT_URI || `${requestPublicBaseUrl(req)}/api/square/callback`;
+
 const oauthClient = (redirectUri = process.env.GOOGLE_REDIRECT_URI) => new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
@@ -138,6 +144,78 @@ const oauthClient = (redirectUri = process.env.GOOGLE_REDIRECT_URI) => new googl
 async function readToken() {
   try { return JSON.parse(await fs.readFile(path.join(dataDir, 'google-token.json'), 'utf8')); }
   catch { return process.env.GOOGLE_REFRESH_TOKEN ? { refresh_token: process.env.GOOGLE_REFRESH_TOKEN } : null; }
+}
+
+async function readSquareToken() {
+  try { return JSON.parse(await fs.readFile(path.join(dataDir, 'square-token.json'), 'utf8')); }
+  catch { return process.env.SQUARE_ACCESS_TOKEN ? { access_token: process.env.SQUARE_ACCESS_TOKEN } : null; }
+}
+
+async function squareAccessToken() {
+  const token = await readSquareToken();
+  return token?.access_token || null;
+}
+
+async function squareConnected() { return Boolean(await squareAccessToken()); }
+
+async function squareRequest(endpoint, options = {}) {
+  const accessToken = await squareAccessToken();
+  if (!accessToken) throw new Error('Square is not connected yet.');
+  const response = await fetch(`${squareApiBase}${endpoint}`, {
+    ...options,
+    headers: { 'Square-Version': squareApiVersion, Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', ...(options.headers || {}) }
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.errors?.map(error => error.detail || error.code).join('; ') || `Square request failed (${response.status}).`);
+  return payload;
+}
+
+async function squareProfile() {
+  const payload = await squareRequest('/locations');
+  const location = (payload.locations || []).find(item => !process.env.SQUARE_LOCATION_ID || item.id === process.env.SQUARE_LOCATION_ID) || payload.locations?.[0];
+  if (!location) throw new Error('No Square location was found.');
+  return { locationId: location.id, name: location.business_name || salonName, address: [location.address?.address_line_1, location.address?.locality, location.address?.administrative_district_level_1, location.address?.postal_code].filter(Boolean).join(', ') };
+}
+
+async function squareServices() {
+  const payload = await squareRequest('/catalog/list?types=ITEM');
+  return (payload.objects || []).flatMap(item => (item.item_data?.variations || []).map(variation => ({
+    id: variation.id,
+    version: variation.version,
+    category: 'Square service',
+    name: variation.item_variation_data?.name || item.item_data?.name || 'Salon service',
+    price: variation.item_variation_data?.price_money ? `$${(variation.item_variation_data.price_money.amount / 100).toFixed(2)}` : '',
+    duration: variation.item_variation_data?.service_duration ? `${Math.round(variation.item_variation_data.service_duration / 60000)} min` : ''
+  })));
+}
+
+async function squareAvailability({ date, service, requestedTime = '', technician = '' }) {
+  const profile = await squareProfile();
+  const services = await squareServices();
+  const query = String(service || '').toLowerCase();
+  const selected = services.find(item => item.name.toLowerCase() === query) || services.find(item => query.includes(item.name.toLowerCase()) || item.name.toLowerCase().includes(query));
+  if (!selected) throw new Error(`Square service not found: ${service}`);
+  const day = date || new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date());
+  const start = toDateTime(day, 0, 0).toISOString();
+  const end = new Date(toDateTime(day, 23, 59).getTime()).toISOString();
+  const payload = await squareRequest('/bookings/availability/search', { method: 'POST', body: JSON.stringify({ query: { filter: { start_at_range: { start_at: start, end_at: end }, location_id: profile.locationId, segment_filters: [{ service_variation_id: selected.id, ...(technician ? { team_member_id_filter: { any: [technician] } } : {}) }] } } }) });
+  let slots = (payload.availabilities || []).map(item => ({ start: item.start_at, end: new Date(new Date(item.start_at).getTime() + Number(item.appointment_segments?.[0]?.duration_minutes || 60) * 60000).toISOString(), label: salonTimeLabel(item.start_at), technician: item.appointment_segments?.[0]?.team_member_id || 'available team member', squareServiceId: selected.id, squareServiceVersion: selected.version }));
+  const requestedMinutes = /^\d{1,2}:\d{2}$/.test(requestedTime) ? requestedTime.split(':').map(Number).reduce((hour, minute) => hour * 60 + minute) : null;
+  if (requestedMinutes !== null) slots.sort((a, b) => Math.abs(Number(localDateParts(new Date(a.start)).hour) * 60 + Number(localDateParts(new Date(a.start)).minute) - requestedMinutes) - Math.abs(Number(localDateParts(new Date(b.start)).hour) * 60 + Number(localDateParts(new Date(b.start)).minute) - requestedMinutes));
+  return { source: 'square', date: day, service: selected.name, durationMinutes: Number(selected.duration.match(/\d+/)?.[0] || 60), slots: slots.slice(0, 3), locationId: profile.locationId };
+}
+
+async function squareBooking(booking) {
+  const profile = await squareProfile();
+  const customer = await squareRequest('/customers', { method: 'POST', body: JSON.stringify({ given_name: booking.customerName, phone_number: booking.phone }) });
+  return squareRequest('/bookings', { method: 'POST', body: JSON.stringify({ idempotency_key: `${Date.now()}-${Math.random().toString(36).slice(2)}`, booking: { customer_id: customer.customer?.id, start_at: booking.start, location_id: booking.locationId || profile.locationId, appointment_segments: [{ duration_minutes: Math.round((new Date(booking.end) - new Date(booking.start)) / 60000), team_member_id: booking.technician, service_variation_id: booking.squareServiceId, service_variation_version: booking.squareServiceVersion }] } }) });
+}
+
+async function squareOAuthToken(params) {
+  const response = await fetch(`${squareOauthBase}/token`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ client_id: process.env.SQUARE_APPLICATION_ID, client_secret: process.env.SQUARE_APPLICATION_SECRET, ...params }) });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.message || payload.errors?.map(error => error.detail || error.code).join('; ') || 'Square authorization failed.');
+  return payload;
 }
 
 async function googleAuth() {
@@ -210,6 +288,7 @@ function salonTimeLabel(value) {
 }
 
 async function checkAvailability({ date, service, requestedTime = '', technician = '' }) {
+  if (await squareConnected()) return squareAvailability({ date, service, requestedTime, technician });
   const detail = serviceDetails(service);
   const day = date || new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date());
   const window = businessWindow(day);
@@ -243,7 +322,23 @@ async function slotIsAvailable(startValue, endValue) {
   return !busy.some(event => event.start < end.getTime() && event.end > start.getTime());
 }
 
+async function squareSlotIsAvailable(booking, checkedSlots) {
+  const returned = checkedSlots.find(slot => new Date(slot.start).getTime() === new Date(booking.start).getTime() && new Date(slot.end).getTime() === new Date(booking.end).getTime());
+  if (!returned) return null;
+  const day = new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date(booking.start));
+  const latest = await squareAvailability({ date: day, service: booking.service, requestedTime: '', technician: booking.technician || '' });
+  return latest.slots.find(slot => new Date(slot.start).getTime() === new Date(booking.start).getTime() && new Date(slot.end).getTime() === new Date(booking.end).getTime()) || null;
+}
+
 async function calendarEvents(date) {
+  if (await squareConnected()) {
+    const profile = await squareProfile();
+    const day = date || new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date());
+    const start = toDateTime(day, 0, 0).toISOString();
+    const end = toDateTime(day, 23, 59).toISOString();
+    const payload = await squareRequest(`/bookings?location_id=${encodeURIComponent(profile.locationId)}&start_at_min=${encodeURIComponent(start)}&start_at_max=${encodeURIComponent(end)}`);
+    return { date: day, events: (payload.bookings || []).map(booking => ({ id: booking.id, summary: booking.appointment_segments?.[0]?.service_variation_id ? `Square appointment · ${booking.status || 'booked'}` : 'Square appointment', description: booking.customer_note || 'Managed by Square Appointments', start: booking.start_at, end: new Date(new Date(booking.start_at).getTime() + Number(booking.appointment_segments?.[0]?.duration_minutes || 60) * 60000).toISOString(), status: booking.status })) };
+  }
   const { calendar: cal } = await calendar();
   const day = date || new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date());
   const start = toDateTime(day, 0, 0);
@@ -268,8 +363,22 @@ async function readSheetInfo() {
 }
 
 async function completeBooking(booking, checkedSlots = []) {
-  const { calendar: cal, sheets } = await calendar();
   if (!String(booking.customerName || '').trim() || /^(customer|unknown|caller|guest|the customer)$/i.test(String(booking.customerName).trim())) throw new Error('I need the customer name before I can complete the booking.');
+  if (await squareConnected()) {
+    const slot = await squareSlotIsAvailable(booking, checkedSlots);
+    if (!slot) throw new Error('That opening was just taken. I will check the next closest time.');
+    const square = await squareBooking({ ...booking, ...slot });
+    const bookingId = square.booking?.id || '';
+    const confirmation = `You’re booked at ${salonName} for ${booking.service} on ${new Date(booking.start).toLocaleString('en-US', { timeZone: timezone, dateStyle: 'full', timeStyle: 'short' })}. See you soon!\n\nAddress: ${salonAddress}`;
+    const [smsResult, ownerResult] = await Promise.allSettled([
+      sendText(booking.phone, confirmation),
+      process.env.SALON_OWNER_PHONE ? sendText(process.env.SALON_OWNER_PHONE, `Mika booked ${booking.customerName} for ${booking.service} on ${new Date(booking.start).toLocaleString('en-US', { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' })}.`) : Promise.resolve({ sent: false, skipped: true })
+    ]);
+    const sms = smsResult.status === 'fulfilled' ? smsResult.value : { sent: false, error: smsResult.reason?.message || 'SMS failed' };
+    const owner = ownerResult.status === 'fulfilled' ? ownerResult.value : { sent: false };
+    return { ...booking, eventId: bookingId, squareBookingId: bookingId, calendarBooked: true, sheetUrl: '', sheetStatus: 'not_required', confirmationSent: sms.sent, smsStatus: sms.sent ? 'sent' : 'failed', smsError: sms.error || '', ownerStatus: owner.sent ? 'sent' : 'skipped', source: 'square' };
+  }
+  const { calendar: cal, sheets } = await calendar();
   const chosenStart = new Date(booking.start).getTime();
   const chosenEnd = new Date(booking.end).getTime();
   const bookingDay = new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date(booking.start));
@@ -351,13 +460,14 @@ const receptionistPrompt = async () => {
   const profileAddress = profile.address || salonAddress;
   const catalog = (profile.services || []).map(item => typeof item === 'string' ? item : `${item.name}${item.duration ? ` (${item.duration})` : ''}${item.price ? ` ${item.price}` : ''}`).join(', ');
   const profileContext = profile.website ? `\n\nSalon profile source: ${profile.website}\nSalon profile name: ${profileName}\nSalon profile description: ${profile.description || 'No description imported.'}\nSalon address: ${profileAddress}\nSalon phone: ${profile.phone || 'Not imported.'}\nSalon hours: ${profile.hours || 'Not imported.'}\nSalon services: ${catalog || 'Not imported.'}` : '';
-  return promptTemplate.replaceAll('{{SALON_NAME}}', profileName).replaceAll('{{SALON_TIMEZONE}}', timezone) + profileContext;
+  const sourceContext = `\n\nScheduling source of truth: ${await squareConnected() ? 'Square Appointments. Availability and booking state must come from Square tool results.' : 'legacy Google Calendar until Square is connected.'}`;
+  return promptTemplate.replaceAll('{{SALON_NAME}}', profileName).replaceAll('{{SALON_TIMEZONE}}', timezone) + profileContext + sourceContext;
 };
 
 function toolDefinitions() {
   return [
-    { type: 'function', name: 'check_availability', description: 'The only way to know appointment availability. Check the connected salon Google Calendar using salon hours, service duration, and a 15-minute buffer. Never invent a slot.', parameters: { type: 'object', properties: { date: { type: 'string', description: 'Requested date in YYYY-MM-DD.' }, service: { type: 'string' }, requestedTime: { type: 'string', description: 'Optional requested local time in HH:MM.' }, technician: { type: 'string' } }, required: ['date', 'service'] } },
-    { type: 'function', name: 'complete_booking', description: 'Only call after the customer chooses one exact slot returned by the latest check_availability result and gives a real name. Ask the caller what name to put the appointment under. Never use Customer, Unknown, Caller, Guest, or a made-up name. The server rejects any other time or placeholder name. Recheck it, create the Calendar event, write the Google Sheet row, and send the Twilio SMS confirmation. The caller phone comes from Twilio automatically.', parameters: { type: 'object', properties: { customerName: { type: 'string', description: 'The real customer name spoken by the caller. Never use a placeholder.' }, phone: { type: 'string' }, service: { type: 'string' }, technician: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' }, notes: { type: 'string' } }, required: ['customerName', 'service', 'start', 'end'] } }
+    { type: 'function', name: 'check_availability', description: 'The only way to know appointment availability. Query the connected Square Appointments account and return only Square slots. Never invent a slot or default to a time.', parameters: { type: 'object', properties: { date: { type: 'string', description: 'Requested date in YYYY-MM-DD.' }, service: { type: 'string' }, requestedTime: { type: 'string', description: 'Optional requested local time in HH:MM.' }, technician: { type: 'string' } }, required: ['date', 'service'] } },
+    { type: 'function', name: 'complete_booking', description: 'Only call after the customer chooses one exact slot returned by the latest check_availability result and gives a real name. Ask the caller what name to put the appointment under. Never use Customer, Unknown, Caller, Guest, or a made-up name. The server rejects any other time or placeholder name. Recheck it, create the booking in Square, record the outcome, and send the Twilio SMS confirmation. The caller phone comes from Twilio automatically.', parameters: { type: 'object', properties: { customerName: { type: 'string', description: 'The real customer name spoken by the caller. Never use a placeholder.' }, phone: { type: 'string' }, service: { type: 'string' }, technician: { type: 'string' }, start: { type: 'string' }, end: { type: 'string' }, notes: { type: 'string' } }, required: ['customerName', 'service', 'start', 'end'] } }
   ];
 }
 
@@ -383,13 +493,19 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/status') {
       const profile = await activeSalonProfile();
       const googleConnected = Boolean(await readToken());
+      const squareIsConnected = await squareConnected();
+      let square = null;
+      if (squareIsConnected) {
+        try { const squareSalon = await squareProfile(); square = { connected: true, locationId: squareSalon.locationId, name: squareSalon.name, address: squareSalon.address, services: await squareServices() }; }
+        catch (error) { square = { connected: true, error: error.message }; }
+      }
       let sheet = await readSheetInfo();
       let sheetError = '';
       if (googleConnected && !sheet) {
         try { const { sheets } = await calendar(); const spreadsheetId = await ensureBookingSheet(sheets); sheet = { spreadsheetId, url: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit` }; }
         catch (error) { sheetError = error.message; console.error(`Booking sheet: ${error.message}`); }
       }
-      return json(res, 200, { salonName: profile.name || salonName, address: profile.address || salonAddress, phone: process.env.TWILIO_PHONE_NUMBER || '', googleConnected, sheet, sheetError, profile });
+      return json(res, 200, { salonName: square?.name || profile.name || salonName, address: square?.address || profile.address || salonAddress, phone: process.env.TWILIO_PHONE_NUMBER || '', schedulingSource: squareIsConnected ? 'Square Appointments' : 'Google Calendar (legacy)', square, googleConnected, sheet, sheetError, profile });
     }
     if (url.pathname === '/api/logs') return json(res, 200, await readLogs());
     if (url.pathname === '/api/calendar/events') return json(res, 200, await calendarEvents(url.searchParams.get('date')));
@@ -406,6 +522,24 @@ const server = http.createServer(async (req, res) => {
       const auth = oauthClient(requestRedirectUri(req));
       const consentUrl = auth.generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: ['https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/spreadsheets'] });
       res.writeHead(302, { location: consentUrl }); return res.end();
+    }
+    if (url.pathname === '/api/square/connect') {
+      if (!process.env.SQUARE_APPLICATION_ID) return json(res, 503, { error: 'Square is not configured yet. Add SQUARE_APPLICATION_ID and SQUARE_APPLICATION_SECRET in Render.' });
+      const state = Math.random().toString(36).slice(2) + Date.now().toString(36);
+      await fs.writeFile(path.join(dataDir, 'square-oauth-state'), state);
+      const params = new URLSearchParams({ client_id: process.env.SQUARE_APPLICATION_ID, scope: 'APPOINTMENTS_ALL_READ APPOINTMENTS_ALL_WRITE CUSTOMERS_READ CUSTOMERS_WRITE MERCHANT_PROFILE_READ', session: squareEnvironment === 'production' ? 'false' : 'true', state, redirect_uri: squareRedirectUri(req) });
+      res.writeHead(302, { location: `${squareOauthBase}/authorize?${params}` }); return res.end();
+    }
+    if (url.pathname === '/api/square/callback') {
+      const code = url.searchParams.get('code');
+      const state = url.searchParams.get('state');
+      let expectedState = '';
+      try { expectedState = await fs.readFile(path.join(dataDir, 'square-oauth-state'), 'utf8'); } catch {}
+      if (!code || !state || state !== expectedState) return json(res, 400, { error: 'Invalid Square authorization response.' });
+      const tokens = await squareOAuthToken({ code, grant_type: 'authorization_code', redirect_uri: squareRedirectUri(req) });
+      await fs.writeFile(path.join(dataDir, 'square-token.json'), JSON.stringify(tokens));
+      await fs.rm(path.join(dataDir, 'square-oauth-state'), { force: true });
+      res.writeHead(302, { location: '/dashboard.html?square=connected' }); return res.end();
     }
     if (url.pathname === '/api/google/callback') {
       const code = url.searchParams.get('code');
