@@ -30,6 +30,7 @@ const squareEnvironment = process.env.SQUARE_ENVIRONMENT === 'sandbox' ? 'sandbo
 const squareApiBase = squareEnvironment === 'sandbox' ? 'https://connect.squareupsandbox.com/v2' : 'https://connect.squareup.com/v2';
 const squareOauthBase = squareEnvironment === 'sandbox' ? 'https://connect.squareupsandbox.com/oauth2' : 'https://connect.squareup.com/oauth2';
 const squareApiVersion = process.env.SQUARE_API_VERSION || '2026-08-19';
+const realtimeModel = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-1.5';
 
 const pauaServices = [
   { category: 'Manicure', name: 'Paua Regular Manicure', price: '$32', duration: '30 min' },
@@ -505,7 +506,7 @@ const server = http.createServer(async (req, res) => {
         try { const { sheets } = await calendar(); const spreadsheetId = await ensureBookingSheet(sheets); sheet = { spreadsheetId, url: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit` }; }
         catch (error) { sheetError = error.message; console.error(`Booking sheet: ${error.message}`); }
       }
-      return json(res, 200, { salonName: square?.name || profile.name || salonName, address: square?.address || profile.address || salonAddress, phone: process.env.TWILIO_PHONE_NUMBER || '', schedulingSource: squareIsConnected ? 'Square Appointments' : 'Google Calendar (legacy)', square, googleConnected, sheet, sheetError, profile });
+      return json(res, 200, { salonName: square?.name || profile.name || salonName, address: square?.address || profile.address || salonAddress, phone: process.env.TWILIO_PHONE_NUMBER || '', schedulingSource: squareIsConnected ? 'Square Appointments' : 'Google Calendar (legacy)', realtimeModel, square, googleConnected, sheet, sheetError, profile });
     }
     if (url.pathname === '/api/logs') return json(res, 200, await readLogs());
     if (url.pathname === '/api/calendar/events') return json(res, 200, await calendarEvents(url.searchParams.get('date')));
@@ -582,13 +583,28 @@ wss.on('connection', (twilioWs) => {
   let callerPhone = '';
   const callContext = { callSid: null, phone: '', lastAvailabilitySlots: [] };
   const connectOpenAI = () => {
-    openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${process.env.OPENAI_REALTIME_MODEL || 'gpt-live-1'}`, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } });
+    openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(realtimeModel)}`, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } });
+    openaiWs.on('error', async (error) => {
+      console.error(`OpenAI realtime error (${realtimeModel}): ${error.message}`);
+      await appendLog({ type: 'voice_error', callSid: callContext.callSid, phone: callerPhone, details: `OpenAI realtime error (${realtimeModel}): ${error.message}` });
+    });
+    openaiWs.on('close', async (code, reason) => {
+      const details = `OpenAI realtime connection closed (${code}${reason?.length ? `: ${reason.toString()}` : ''})`;
+      console.error(details);
+      await appendLog({ type: 'voice_error', callSid: callContext.callSid, phone: callerPhone, details });
+    });
     openaiWs.on('open', async () => {
       openaiWs.send(JSON.stringify({ type: 'session.update', session: { type: 'realtime', instructions: await receptionistPrompt(), output_modalities: ['audio'], audio: { input: { format: { type: 'audio/pcmu' }, turn_detection: { type: 'server_vad', threshold: 0.7, prefix_padding_ms: 400, silence_duration_ms: 1200, create_response: false, interrupt_response: true } }, output: { format: { type: 'audio/pcmu' }, voice: 'marin' } }, tools: toolDefinitions(), tool_choice: 'auto' } }));
       openaiWs.send(JSON.stringify({ type: 'response.create', response: { instructions: `Say exactly: Hi, this is ${salonName}. How can I help you?` } }));
     });
     openaiWs.on('message', async (raw) => {
       const event = JSON.parse(raw.toString());
+      if (event.type === 'error') {
+        const details = event.error?.message || 'OpenAI realtime session error.';
+        console.error(details);
+        await appendLog({ type: 'voice_error', callSid: callContext.callSid, phone: callerPhone, details });
+        return;
+      }
       if (event.type === 'response.output_audio.delta' && streamSid) twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: event.delta } }));
       if (event.type === 'input_audio_buffer.speech_stopped') openaiWs.send(JSON.stringify({ type: 'response.create' }));
       if (event.type === 'response.function_call_arguments.done') {
