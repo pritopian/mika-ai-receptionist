@@ -582,7 +582,7 @@ wss.on('connection', (twilioWs) => {
   let callerPhone = '';
   const callContext = { callSid: null, phone: '', lastAvailabilitySlots: [] };
   const connectOpenAI = () => {
-    openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-mini'}`, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } });
+    openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${process.env.OPENAI_REALTIME_MODEL || 'gpt-live-1'}`, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } });
     openaiWs.on('open', async () => {
       openaiWs.send(JSON.stringify({ type: 'session.update', session: { type: 'realtime', instructions: await receptionistPrompt(), output_modalities: ['audio'], audio: { input: { format: { type: 'audio/pcmu' }, turn_detection: { type: 'server_vad', threshold: 0.7, prefix_padding_ms: 400, silence_duration_ms: 1200, create_response: false, interrupt_response: true } }, output: { format: { type: 'audio/pcmu' }, voice: 'marin' } }, tools: toolDefinitions(), tool_choice: 'auto' } }));
       openaiWs.send(JSON.stringify({ type: 'response.create', response: { instructions: `Say exactly: Hi, this is ${salonName}. How can I help you?` } }));
