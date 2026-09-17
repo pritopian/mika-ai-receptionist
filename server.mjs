@@ -7,6 +7,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { google } from 'googleapis';
 import twilio from 'twilio';
 import { attachLiveBridge } from './live-bridge.mjs';
+import { localDay, resolveBookingDay, clockContext, withinBusinessWindow, selectBookableService, selectTechnician } from './booking-policy.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.join(root, '.data');
@@ -186,26 +187,38 @@ async function squareServices() {
     id: variation.id,
     version: variation.version,
     category: 'Square service',
-    name: variation.item_variation_data?.name || item.item_data?.name || 'Salon service',
+    name: [item.item_data?.name, variation.item_variation_data?.name === 'Regular' ? '' : variation.item_variation_data?.name].filter(Boolean).join(' - ') || 'Salon service',
     price: variation.item_variation_data?.price_money ? `$${(variation.item_variation_data.price_money.amount / 100).toFixed(2)}` : '',
     duration: variation.item_variation_data?.service_duration ? `${Math.round(variation.item_variation_data.service_duration / 60000)} min` : ''
   })));
 }
 
-async function squareAvailability({ date, service, requestedTime = '', technician = '' }) {
+async function squareAvailability({ date, service, requestedTime = '', technician = '', verifiedTechnicianId = '' }) {
   const profile = await squareProfile();
   const services = await squareServices();
-  const query = String(service || '').toLowerCase();
-  const selected = services.find(item => item.name.toLowerCase() === query) || services.find(item => query.includes(item.name.toLowerCase()) || item.name.toLowerCase().includes(query));
-  if (!selected) throw new Error(`Square service not found: ${service}`);
-  const day = date || new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date());
+  const selected = selectBookableService(services, service);
+  const day = resolveBookingDay(date, timezone);
+  const window = businessWindow(day);
+  if (!window) return { source: 'square', date: day, slots: [], reason: 'The salon is closed that day.' };
+  if (verifiedTechnicianId) technician = verifiedTechnicianId;
+  else if (technician && !/^(any|anyone|no preference|available team member)$/i.test(technician.trim())) {
+    const people = [];
+    let cursor;
+    do {
+      const params = new URLSearchParams({ bookable_only: 'true', location_id: profile.locationId, ...(cursor ? { cursor } : {}) });
+      const page = await squareRequest(`/bookings/team-member-booking-profiles?${params}`);
+      people.push(...(page.team_member_booking_profiles || []));
+      cursor = page.cursor;
+    } while (cursor);
+    technician = selectTechnician(people, technician);
+  } else technician = '';
   const start = toDateTime(day, 0, 0).toISOString();
   const end = new Date(toDateTime(day, 23, 59).getTime()).toISOString();
   const payload = await squareRequest('/bookings/availability/search', { method: 'POST', body: JSON.stringify({ query: { filter: { start_at_range: { start_at: start, end_at: end }, location_id: profile.locationId, segment_filters: [{ service_variation_id: selected.id, ...(technician ? { team_member_id_filter: { any: [technician] } } : {}) }] } } }) });
-  let slots = (payload.availabilities || []).map(item => ({ start: item.start_at, end: new Date(new Date(item.start_at).getTime() + Number(item.appointment_segments?.[0]?.duration_minutes || 60) * 60000).toISOString(), label: salonTimeLabel(item.start_at), technician: item.appointment_segments?.[0]?.team_member_id || 'available team member', squareServiceId: selected.id, squareServiceVersion: selected.version }));
+  let slots = (payload.availabilities || []).filter(item => item.appointment_segments?.length === 1 && item.appointment_segments[0].duration_minutes > 0).map(item => ({ start: item.start_at, end: new Date(new Date(item.start_at).getTime() + Number(item.appointment_segments[0].duration_minutes) * 60000).toISOString(), label: salonTimeLabel(item.start_at), technician: item.appointment_segments[0].team_member_id, squareServiceId: selected.id, squareServiceVersion: selected.version })).filter(slot => withinBusinessWindow(slot, window));
   const requestedMinutes = /^\d{1,2}:\d{2}$/.test(requestedTime) ? requestedTime.split(':').map(Number).reduce((hour, minute) => hour * 60 + minute) : null;
   if (requestedMinutes !== null) slots.sort((a, b) => Math.abs(Number(localDateParts(new Date(a.start)).hour) * 60 + Number(localDateParts(new Date(a.start)).minute) - requestedMinutes) - Math.abs(Number(localDateParts(new Date(b.start)).hour) * 60 + Number(localDateParts(new Date(b.start)).minute) - requestedMinutes));
-  return { source: 'square', date: day, service: selected.name, durationMinutes: Number(selected.duration.match(/\d+/)?.[0] || 60), slots: slots.slice(0, 3), locationId: profile.locationId };
+  return { source: 'square', date: day, service: selected.name, durationMinutes: Number(selected.duration.match(/\d+/)?.[0] || 60), slots: slots.slice(0, 3), locationId: profile.locationId, hours: { open: salonTimeLabel(window.start), close: salonTimeLabel(window.end) } };
 }
 
 async function squareBooking(booking) {
@@ -272,6 +285,7 @@ async function calendarBusy(start, end) {
 function businessWindow(day) {
   const weekday = new Date(`${day}T12:00:00Z`).getUTCDay();
   const hours = weeklyHours?.[weekday];
+  if (weeklyHours && !Array.isArray(hours)) return null;
   if (Array.isArray(hours)) {
     const [startHour, startMinute] = String(hours[0]).split(':').map(Number);
     const [endHour, endMinute] = String(hours[1]).split(':').map(Number);
@@ -291,6 +305,7 @@ function salonTimeLabel(value) {
 }
 
 async function checkAvailability({ date, service, requestedTime = '', technician = '' }) {
+  date = resolveBookingDay(date, timezone);
   if (await squareConnected()) return squareAvailability({ date, service, requestedTime, technician });
   const detail = serviceDetails(service);
   const day = date || new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date());
@@ -303,7 +318,7 @@ async function checkAvailability({ date, service, requestedTime = '', technician
     const slotStart = new Date(window.start.getTime() + minutes * 60000);
     const slotEnd = new Date(slotStart.getTime() + detail.durationMinutes * 60000);
     const overlaps = busy.some(event => event.start < slotEnd.getTime() && event.end > slotStart.getTime());
-    if (!overlaps) candidateSlots.push({ start: slotStart.toISOString(), end: slotEnd.toISOString(), label: salonTimeLabel(slotStart), technician: technician || 'available team member' });
+    if (!overlaps && slotStart > new Date()) candidateSlots.push({ start: slotStart.toISOString(), end: slotEnd.toISOString(), label: salonTimeLabel(slotStart), technician: technician || 'available team member' });
   }
   const requestedMinutes = /^\d{1,2}:\d{2}$/.test(requestedTime) ? requestedTime.split(':').map(Number).reduce((hour, minute) => hour * 60 + minute) : null;
   const hourSlots = candidateSlots.filter(slot => localDateParts(new Date(slot.start)).minute === '00');
@@ -329,8 +344,9 @@ async function squareSlotIsAvailable(booking, checkedSlots) {
   const returned = checkedSlots.find(slot => new Date(slot.start).getTime() === new Date(booking.start).getTime() && new Date(slot.end).getTime() === new Date(booking.end).getTime());
   if (!returned) return null;
   const day = new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(new Date(booking.start));
-  const latest = await squareAvailability({ date: day, service: booking.service, requestedTime: '', technician: booking.technician || '' });
-  return latest.slots.find(slot => new Date(slot.start).getTime() === new Date(booking.start).getTime() && new Date(slot.end).getTime() === new Date(booking.end).getTime()) || null;
+  const parts = localDateParts(new Date(booking.start));
+  const latest = await squareAvailability({ date: day, service: booking.service, requestedTime: `${parts.hour}:${parts.minute}`, verifiedTechnicianId: returned.technician || '' });
+  return latest.slots.find(slot => slot.squareServiceId === returned.squareServiceId && slot.technician === returned.technician && new Date(slot.start).getTime() === new Date(booking.start).getTime() && new Date(slot.end).getTime() === new Date(booking.end).getTime()) || null;
 }
 
 async function calendarEvents(date) {
@@ -366,6 +382,8 @@ async function readSheetInfo() {
 }
 
 async function completeBooking(booking, checkedSlots = []) {
+  const validStart = new Date(booking.start);
+  if (Number.isNaN(validStart.getTime()) || !withinBusinessWindow(booking, businessWindow(localDay(validStart, timezone)))) throw new Error('That appointment is outside salon opening hours or in the past. Check another opening.');
   if (!String(booking.customerName || '').trim() || /^(customer|unknown|caller|guest|the customer)$/i.test(String(booking.customerName).trim())) throw new Error('I need the customer name before I can complete the booking.');
   if (await squareConnected()) {
     const slot = await squareSlotIsAvailable(booking, checkedSlots);
@@ -464,8 +482,20 @@ const receptionistPrompt = async () => {
   const catalog = (profile.services || []).map(item => typeof item === 'string' ? item : `${item.name}${item.duration ? ` (${item.duration})` : ''}${item.price ? ` ${item.price}` : ''}`).join(', ');
   const profileContext = profile.website ? `\n\nSalon profile source: ${profile.website}\nSalon profile name: ${profileName}\nSalon profile description: ${profile.description || 'No description imported.'}\nSalon address: ${profileAddress}\nSalon phone: ${profile.phone || 'Not imported.'}\nSalon hours: ${profile.hours || 'Not imported.'}\nSalon services: ${catalog || 'Not imported.'}` : '';
   const sourceContext = `\n\nScheduling source of truth: ${await squareConnected() ? 'Square Appointments. Availability and booking state must come from Square tool results.' : 'legacy Google Calendar until Square is connected.'}`;
-  return promptTemplate.replaceAll('{{SALON_NAME}}', profileName).replaceAll('{{SALON_TIMEZONE}}', timezone) + profileContext + sourceContext;
+  return promptTemplate.replaceAll('{{SALON_NAME}}', profileName).replaceAll('{{SALON_TIMEZONE}}', timezone) + profileContext + sourceContext + '\n\n' + clockContext(timezone) + '\n' + salonScheduleContext();
 };
+
+function salonScheduleContext() {
+  const today = localDay(new Date(), timezone);
+  const days = Array.from({ length: 7 }, (_, offset) => {
+    const date = new Date(`${today}T12:00:00Z`);
+    date.setUTCDate(date.getUTCDate() + offset);
+    const day = date.toISOString().slice(0, 10);
+    const window = businessWindow(day);
+    return `${day} (${date.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' })}): ${window ? `${salonTimeLabel(window.start)} to ${salonTimeLabel(window.end)}` : 'closed'}`;
+  });
+  return `Enforced booking hours for the next seven days: ${days.join('; ')}. These configured hours govern bookings. The entire appointment must finish by closing; hours alone never imply availability.`;
+}
 
 function toolDefinitions() {
   return [
@@ -589,6 +619,7 @@ wss.on('connection', (twilioWs) => {
       apiKey: process.env.OPENAI_API_KEY, model: realtimeModel,
       backendModel: liveBackendModel,
       salonName, getInstructions: receptionistPrompt, tools: toolDefinitions(),
+      getVoiceContext: async () => `${clockContext(timezone)}\n${salonScheduleContext()}`,
       executeTool: handleTool, log: appendLog,
     });
     return;

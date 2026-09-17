@@ -2,7 +2,7 @@ import { WebSocket } from 'ws';
 
 export function attachLiveBridge(twilioWs, {
   apiKey, model = 'gpt-live-1', backendModel = 'gpt-5.6-luna', salonName,
-  getInstructions, tools, executeTool, log = async () => {},
+  getInstructions, getVoiceContext = async () => '', tools, executeTool, log = async () => {},
   Socket = WebSocket, startupTimeoutMs = 20000, closeTimeoutMs = 5000,
 }) {
   let socket;
@@ -103,6 +103,7 @@ export function attachLiveBridge(twilioWs, {
     startupTimer = setTimeout(() => fail('Session startup timed out.'), startupTimeoutMs);
     startupTimer.unref?.();
     const instructions = await getInstructions();
+    const voiceContext = await getVoiceContext();
     if (ended) return;
     socket = new Socket('wss://api.openai.com/v1/live/sessions', { headers: { Authorization: `Bearer ${apiKey}` } });
     socket.on('open', () => {
@@ -110,6 +111,7 @@ export function attachLiveBridge(twilioWs, {
       send({ type: 'session.start', session: {
         model,
         instructions: `You are Mika, a warm, concise phone receptionist for ${salonName}. Speak English unless the caller requests another language.\nBackchannel policy: Use moderate backchannels.\nInterruption policy: Stop speaking when interrupted and listen.\nDelegation policy:\nBackend tools: salon service and hours information, appointment availability, and creating bookings.\nDelegate to the backend when the caller asks about services, hours, prices, availability, booking, or corrects a pending booking request. Delegate before answering questions that depend on that information. Never guess availability, prices, or a booking result.\nDo not delegate for greetings, simple clarification, or repeating a confirmed result. Ask one question at a time. Never claim a booking or text confirmation succeeded without backend confirmation.`,
+        input: [{ type: 'message', role: 'developer', content: [{ type: 'input_text', text: `${voiceContext}\nBooking conversation: Accept manicure, pedicure, or both without reciting the menu or asking about variants, gel, or nail art unless the caller volunteers them. The backend maps a generic request to the configured basic service; never silently substitute a specialty service. Ask if they have visited before. For a returning client, ask whether they want a particular technician; if not, use any available technician. Capture that preference before checking openings. Do not repeat already answered questions. Resolve tomorrow from the supplied local clock, without asking for the month or year. Ask one brief question at a time. Both services must actually be supported before promising a combined appointment.` }] }],
         audio: { format: { type: 'audio/pcmu', rate: 8000 }, output: { voice: 'marin' } },
         delegation: { type: 'responses', responses: {
           model: backendModel,

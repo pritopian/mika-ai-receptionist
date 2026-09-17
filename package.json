@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "node server.mjs",
     "start": "node server.mjs",
-    "test": "node --test live-bridge.test.mjs",
+    "test": "node --test live-bridge.test.mjs booking-policy.test.mjs",
     "test:live": "node smoke-live.mjs"
   },
   "dependencies": {

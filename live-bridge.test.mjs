@@ -21,6 +21,7 @@ async function setup(t, executeTool = async () => ({ slots: [] }), options = {})
   }
   attachLiveBridge(phone, {
     apiKey: 'test-only', salonName: 'Test Salon', getInstructions: async () => 'Never invent availability.',
+    getVoiceContext: async () => 'Tomorrow is 2026-09-17. Opening hours: noon to 7:30 PM.',
     tools: [{ type: 'function', name: 'check_availability', parameters: { type: 'object' } }],
     executeTool, Socket: Connection, closeTimeoutMs: 1, ...options,
   });
@@ -36,6 +37,8 @@ test('Live handshake, buffered PCMU, acknowledged greeting and bidirectional aud
   assert.equal(ai.url, 'wss://api.openai.com/v1/live/sessions');
   assert.equal(ai.sent[0].type, 'session.start');
   assert.equal(ai.sent[0].session.model, 'gpt-live-1');
+  assert.match(ai.sent[0].session.input[0].content[0].text, /Tomorrow is 2026-09-17/);
+  assert.match(ai.sent[0].session.input[0].content[0].text, /returning client/);
   assert.deepEqual(ai.sent[0].session.audio.format, { type: 'audio/pcmu', rate: 8000 });
   phone.receive({ event: 'media', media: { payload: 'early' } });
   assert.equal(ai.sent.length, 1);
