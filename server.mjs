@@ -573,11 +573,14 @@ const server = http.createServer(async (req, res) => {
 
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
-  if (new URL(req.url, `http://${req.headers.host}`).pathname !== '/twilio/media') return socket.destroy();
+  const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
+  console.log(`WebSocket upgrade requested: ${pathname}`);
+  if (pathname !== '/twilio/media') return socket.destroy();
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
 
 wss.on('connection', (twilioWs) => {
+  console.log('Twilio media WebSocket connected');
   let streamSid;
   let openaiWs;
   let callerPhone = '';
@@ -636,7 +639,19 @@ wss.on('connection', (twilioWs) => {
       }
     });
   };
-  twilioWs.on('message', (raw) => { const event = JSON.parse(raw.toString()); if (event.event === 'start') { streamSid = event.start.streamSid; callerPhone = event.start.customParameters?.callerPhone || ''; callContext.callSid = event.start.callSid || null; callContext.phone = callerPhone; appendLog({ type: 'call_started', callSid: callContext.callSid, phone: callerPhone }); connectOpenAI(); } if (event.event === 'media' && openaiWs?.readyState === WebSocket.OPEN) openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: event.media.payload })); });
+  twilioWs.on('error', async (error) => {
+    console.error(`Twilio media WebSocket error: ${error.message}`);
+    await appendLog({ type: 'voice_error', callSid: callContext.callSid, phone: callerPhone, details: `Twilio media WebSocket error: ${error.message}` });
+  });
+  twilioWs.on('message', (raw) => {
+    try {
+      const event = JSON.parse(raw.toString());
+      if (event.event === 'start') { streamSid = event.start.streamSid; callerPhone = event.start.customParameters?.callerPhone || ''; callContext.callSid = event.start.callSid || null; callContext.phone = callerPhone; appendLog({ type: 'call_started', callSid: callContext.callSid, phone: callerPhone }); connectOpenAI(); }
+      if (event.event === 'media' && openaiWs?.readyState === WebSocket.OPEN) openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: event.media.payload }));
+    } catch (error) {
+      console.error(`Twilio media message error: ${error.message}`);
+    }
+  });
   twilioWs.on('close', () => openaiWs?.close());
 });
 
