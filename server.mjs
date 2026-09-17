@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { google } from 'googleapis';
 import twilio from 'twilio';
+import { attachLiveBridge } from './live-bridge.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.join(root, '.data');
@@ -30,7 +31,8 @@ const squareEnvironment = process.env.SQUARE_ENVIRONMENT === 'sandbox' ? 'sandbo
 const squareApiBase = squareEnvironment === 'sandbox' ? 'https://connect.squareupsandbox.com/v2' : 'https://connect.squareup.com/v2';
 const squareOauthBase = squareEnvironment === 'sandbox' ? 'https://connect.squareupsandbox.com/oauth2' : 'https://connect.squareup.com/oauth2';
 const squareApiVersion = process.env.SQUARE_API_VERSION || '2026-08-19';
-const realtimeModel = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-1.5';
+const realtimeModel = process.env.OPENAI_REALTIME_MODEL || 'gpt-live-1';
+const liveBackendModel = process.env.OPENAI_LIVE_BACKEND_MODEL || 'gpt-5.6-luna';
 
 const pauaServices = [
   { category: 'Manicure', name: 'Paua Regular Manicure', price: '$32', duration: '30 min' },
@@ -506,7 +508,7 @@ const server = http.createServer(async (req, res) => {
         try { const { sheets } = await calendar(); const spreadsheetId = await ensureBookingSheet(sheets); sheet = { spreadsheetId, url: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit` }; }
         catch (error) { sheetError = error.message; console.error(`Booking sheet: ${error.message}`); }
       }
-      return json(res, 200, { salonName: square?.name || profile.name || salonName, address: square?.address || profile.address || salonAddress, phone: process.env.TWILIO_PHONE_NUMBER || '', schedulingSource: squareIsConnected ? 'Square Appointments' : 'Google Calendar (legacy)', realtimeModel, square, googleConnected, sheet, sheetError, profile });
+      return json(res, 200, { salonName: square?.name || profile.name || salonName, address: square?.address || profile.address || salonAddress, phone: process.env.TWILIO_PHONE_NUMBER || '', schedulingSource: squareIsConnected ? 'Square Appointments' : 'Google Calendar (legacy)', realtimeModel, voiceProtocol: realtimeModel.startsWith('gpt-live-') ? 'live' : 'realtime', liveBackendModel, square, googleConnected, sheet, sheetError, profile });
     }
     if (url.pathname === '/api/logs') return json(res, 200, await readLogs());
     if (url.pathname === '/api/calendar/events') return json(res, 200, await calendarEvents(url.searchParams.get('date')));
@@ -559,6 +561,7 @@ const server = http.createServer(async (req, res) => {
       const streamBase = requestPublicBaseUrl(req).replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
       const stream = connect.stream({ url: `${streamBase}/twilio/media` });
       if (body.From) stream.parameter({ name: 'callerPhone', value: body.From });
+      twiml.say('Sorry, the receptionist connection has ended. Please call again shortly.');
       res.writeHead(200, { 'content-type': 'text/xml' }); return res.end(twiml.toString());
     }
     const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
@@ -581,6 +584,15 @@ server.on('upgrade', (req, socket, head) => {
 
 wss.on('connection', (twilioWs) => {
   console.log('Twilio media WebSocket connected');
+  if (realtimeModel.startsWith('gpt-live-')) {
+    attachLiveBridge(twilioWs, {
+      apiKey: process.env.OPENAI_API_KEY, model: realtimeModel,
+      backendModel: liveBackendModel,
+      salonName, getInstructions: receptionistPrompt, tools: toolDefinitions(),
+      executeTool: handleTool, log: appendLog,
+    });
+    return;
+  }
   let streamSid;
   let openaiWs;
   let callerPhone = '';

@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "dev": "node server.mjs",
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "test": "node --test live-bridge.test.mjs",
+    "test:live": "node smoke-live.mjs"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
