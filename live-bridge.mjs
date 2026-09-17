@@ -115,7 +115,7 @@ export function attachLiveBridge(twilioWs, {
         audio: { format: { type: 'audio/pcmu', rate: 8000 }, output: { voice: 'marin' } },
         delegation: { type: 'responses', responses: {
           model: backendModel,
-          instructions: `${instructions}\n\nYou are Mika's booking backend for a live phone conversation. Return concise, factual guidance for the voice model. Use tools for availability and bookings, never invented slots. Offer at most three exact returned slots. Collect a real name and the caller's choice of a returned slot before booking. Do not retry a booking with an uncertain outcome. Distinguish booking success from SMS delivery and report failures honestly.`,
+          instructions: `${instructions}\n\nYou are Mika's booking backend for a live phone conversation. Return concise, factual guidance for the voice model. Use tools for availability and bookings, never invented slots. For a requested time, lead with a direct yes or no using requestedTimeAvailable: if true, say the requested time is available; if false, offer the nearest one or two returned alternatives. Never describe an available slot as already booked. Do not repeat the service menu or ask for details already supplied. Offer at most three exact returned slots. Collect a real name and the caller's choice of a returned slot before booking. Do not retry a booking with an uncertain outcome. Distinguish booking success from SMS delivery and report failures honestly.`,
           tools: tools.map(tool => ({ ...tool, strict: false })),
           tool_choice: 'auto', parallel_tool_calls: false,
         } },

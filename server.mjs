@@ -7,6 +7,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { google } from 'googleapis';
 import twilio from 'twilio';
 import { attachLiveBridge } from './live-bridge.mjs';
+import { createMetadataCache } from './square-cache.mjs';
 import { localDay, resolveBookingDay, clockContext, withinBusinessWindow, selectBookableService, selectTechnician } from './booking-policy.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -162,9 +163,20 @@ async function squareAccessToken() {
 
 async function squareConnected() { return Boolean(await squareAccessToken()); }
 
+const squareMetadata = createMetadataCache();
+
 async function squareRequest(endpoint, options = {}) {
   const accessToken = await squareAccessToken();
   if (!accessToken) throw new Error('Square is not connected yet.');
+  const load = () => squareFetch(endpoint, options, accessToken);
+  // Availability and booking writes must always reach Square, including rechecks.
+  if ((!options.method || options.method === 'GET') && (endpoint === '/locations' || endpoint.startsWith('/catalog/list?'))) {
+    return squareMetadata(`${accessToken}:${endpoint}`, load);
+  }
+  return load();
+}
+
+async function squareFetch(endpoint, options, accessToken) {
   const response = await fetch(`${squareApiBase}${endpoint}`, {
     ...options,
     headers: { 'Square-Version': squareApiVersion, Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json', ...(options.headers || {}) }
@@ -226,7 +238,11 @@ async function squareAvailability({ date, service, requestedTime = '', technicia
   let slots = (payload.availabilities || []).filter(item => item.appointment_segments?.length === 1 && item.appointment_segments[0].duration_minutes > 0).map(item => ({ start: item.start_at, end: new Date(new Date(item.start_at).getTime() + Number(item.appointment_segments[0].duration_minutes) * 60000).toISOString(), label: salonTimeLabel(item.start_at), technician: item.appointment_segments[0].team_member_id, squareServiceId: selected.id, squareServiceVersion: selected.version })).filter(slot => withinBusinessWindow(slot, window));
   const requestedMinutes = /^\d{1,2}:\d{2}$/.test(requestedTime) ? requestedTime.split(':').map(Number).reduce((hour, minute) => hour * 60 + minute) : null;
   if (requestedMinutes !== null) slots.sort((a, b) => Math.abs(Number(localDateParts(new Date(a.start)).hour) * 60 + Number(localDateParts(new Date(a.start)).minute) - requestedMinutes) - Math.abs(Number(localDateParts(new Date(b.start)).hour) * 60 + Number(localDateParts(new Date(b.start)).minute) - requestedMinutes));
-  return { source: 'square', date: day, service: selected.name, durationMinutes: Number(selected.duration.match(/\d+/)?.[0] || 60), slots: slots.slice(0, 3), locationId: profile.locationId, hours: { open: salonTimeLabel(window.start), close: salonTimeLabel(window.end) } };
+  const requestedTimeAvailable = requestedMinutes === null ? null : slots.some(slot => {
+    const parts = localDateParts(new Date(slot.start));
+    return Number(parts.hour) * 60 + Number(parts.minute) === requestedMinutes;
+  });
+  return { source: 'square', date: day, service: selected.name, requestedTime, requestedTimeAvailable, durationMinutes: Number(selected.duration.match(/\d+/)?.[0] || 60), slots: slots.slice(0, 3), locationId: profile.locationId, hours: { open: salonTimeLabel(window.start), close: salonTimeLabel(window.end) } };
 }
 
 async function squareBooking(booking) {
@@ -514,9 +530,10 @@ function toolDefinitions() {
 
 async function handleTool(name, args, context = {}) {
   if (name === 'check_availability') {
+    const started = performance.now();
     const output = await checkAvailability(args);
     context.lastAvailabilitySlots = output.slots || [];
-    await appendLog({ type: 'tool_check_availability', callSid: context.callSid, phone: context.phone, details: JSON.stringify({ args, output }) });
+    await appendLog({ type: 'tool_check_availability', callSid: context.callSid, phone: context.phone, details: JSON.stringify({ args, output, durationMs: Math.round(performance.now() - started) }) });
     return output;
   }
   if (name === 'complete_booking') {
