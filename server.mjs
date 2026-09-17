@@ -182,8 +182,15 @@ async function squareProfile() {
 }
 
 async function squareServices() {
-  const payload = await squareRequest('/catalog/list?types=ITEM');
-  return (payload.objects || []).flatMap(item => (item.item_data?.variations || []).map(variation => ({
+  const objects = [];
+  let cursor;
+  do {
+    const params = new URLSearchParams({ types: 'ITEM', ...(cursor ? { cursor } : {}) });
+    const payload = await squareRequest(`/catalog/list?${params}`);
+    objects.push(...(payload.objects || []));
+    cursor = payload.cursor;
+  } while (cursor);
+  return objects.flatMap(item => (item.item_data?.variations || []).map(variation => ({
     id: variation.id,
     version: variation.version,
     category: 'Square service',
@@ -197,6 +204,7 @@ async function squareAvailability({ date, service, requestedTime = '', technicia
   const profile = await squareProfile();
   const services = await squareServices();
   const selected = selectBookableService(services, service);
+  if (!selected.duration) throw new Error('This service has no appointment duration configured in Square. Explain that scheduling is not configured, not that the salon is fully booked.');
   const day = resolveBookingDay(date, timezone);
   const window = businessWindow(day);
   if (!window) return { source: 'square', date: day, slots: [], reason: 'The salon is closed that day.' };
@@ -560,7 +568,7 @@ const server = http.createServer(async (req, res) => {
       if (!process.env.SQUARE_APPLICATION_ID) return json(res, 503, { error: 'Square is not configured yet. Add SQUARE_APPLICATION_ID and SQUARE_APPLICATION_SECRET in Render.' });
       const state = Math.random().toString(36).slice(2) + Date.now().toString(36);
       await fs.writeFile(path.join(dataDir, 'square-oauth-state'), state);
-      const params = new URLSearchParams({ client_id: process.env.SQUARE_APPLICATION_ID, scope: 'APPOINTMENTS_ALL_READ APPOINTMENTS_ALL_WRITE CUSTOMERS_READ CUSTOMERS_WRITE MERCHANT_PROFILE_READ', session: squareEnvironment === 'production' ? 'false' : 'true', state, redirect_uri: squareRedirectUri(req) });
+      const params = new URLSearchParams({ client_id: process.env.SQUARE_APPLICATION_ID, scope: 'APPOINTMENTS_READ APPOINTMENTS_WRITE APPOINTMENTS_ALL_READ APPOINTMENTS_ALL_WRITE APPOINTMENTS_BUSINESS_SETTINGS_READ ITEMS_READ CUSTOMERS_READ CUSTOMERS_WRITE MERCHANT_PROFILE_READ', session: squareEnvironment === 'production' ? 'false' : 'true', state, redirect_uri: squareRedirectUri(req) });
       res.writeHead(302, { location: `${squareOauthBase}/authorize?${params}` }); return res.end();
     }
     if (url.pathname === '/api/square/callback') {
@@ -619,7 +627,11 @@ wss.on('connection', (twilioWs) => {
       apiKey: process.env.OPENAI_API_KEY, model: realtimeModel,
       backendModel: liveBackendModel,
       salonName, getInstructions: receptionistPrompt, tools: toolDefinitions(),
-      getVoiceContext: async () => `${clockContext(timezone)}\n${salonScheduleContext()}`,
+      getVoiceContext: async () => {
+        const profile = await activeSalonProfile();
+        const services = (profile.services || []).map(item => typeof item === 'string' ? item : `${item.name}: ${item.price || 'price not supplied'}, ${item.duration || 'duration not supplied'}`).join('; ');
+        return `${clockContext(timezone)}\n${salonScheduleContext()}\nSalon reference facts: ${JSON.stringify({ name: profile.name || salonName, address: profile.address || salonAddress, services })}. Use these facts directly without a lookup. This reference menu does not prove that a service is configured in Square or that a slot is open. Only backend results establish booking availability. If scheduling is not configured, explain that once; do not call it fully booked or keep retrying.`;
+      },
       executeTool: handleTool, log: appendLog,
     });
     return;

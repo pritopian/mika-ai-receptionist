@@ -37,6 +37,8 @@ test('Live handshake, buffered PCMU, acknowledged greeting and bidirectional aud
   assert.equal(ai.url, 'wss://api.openai.com/v1/live/sessions');
   assert.equal(ai.sent[0].type, 'session.start');
   assert.equal(ai.sent[0].session.model, 'gpt-live-1');
+  assert.match(ai.sent[0].session.instructions, /Answer known salon questions directly/);
+  assert.match(ai.sent[0].session.instructions, /Do not delegate for supplied service descriptions/);
   assert.match(ai.sent[0].session.input[0].content[0].text, /Tomorrow is 2026-09-17/);
   assert.match(ai.sent[0].session.input[0].content[0].text, /returning client/);
   assert.deepEqual(ai.sent[0].session.audio.format, { type: 'audio/pcmu', rate: 8000 });
